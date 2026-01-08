@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}✅ 单帧评级成功{% endblock %}
+
+{% block content %}
+    <p style="margin: 8px 0;"><strong>Frame ID:</strong> <code>{{ frame_id }}</code></p>
+    <p style="margin: 8px 0;"><strong>设定评级:</strong> <span style="color: {{ color }}; font-weight: bold;">{{ score }}</span></p>
+    <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;">
+    <p style="margin: 5px 0; font-size: 0.9em; color: #666;"><strong>数据库:</strong> {{ db }}</p>
+    <p style="margin: 5px 0; font-size: 0.9em; color: #666;"><strong>数据集:</strong> {{ col }}</p>
+{% endblock %}

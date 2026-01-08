@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Confirm Range Rating</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 40px; color: #2c3e50; line-height: 1.6; }
+        .card { display: inline-block; background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #e1e4e8; text-align: left; min-width: 400px; }
+        .ts-box { background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #ddd; font-family: monospace; margin: 10px 0; }
+        .btn-group { margin-top: 30px; display: flex; justify-content: space-around; }
+        button { padding: 12px 25px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 1.1em; transition: transform 0.1s; }
+        button:active { transform: scale(0.95); }
+        .btn-a { background: #2ecc71; color: white; }
+        .btn-b { background: #3498db; color: white; }
+        .btn-c { background: #f1c40f; color: white; }
+        .btn-d { background: #e67e22; color: white; }
+        .loading { display: none; color: #7f8c8d; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h2>⚡ 区间打分确认</h2>
+    
+    <div class="card">
+        <p><strong>数据库:</strong> {{ db }}</p>
+        <p><strong>数据集:</strong> {{ col }}</p>
+        <hr>
+        <p>🚩 <b>开始时间戳:</b></p>
+        <div id="start_ts" class="ts-box">Loading...</div>
+        <p>🏁 <b>结束时间戳:</b></p>
+        <div id="end_ts" class="ts-box">Loading...</div>
+    </div>
+
+    <div id="action-area">
+        <p style="margin-top: 20px; color: #7f8c8d;">请选择评级以提交：</p>
+        <div class="btn-group">
+            <button class="btn-a" onclick="submitRange('A')">A</button>
+            <button class="btn-b" onclick="submitRange('B')">B</button>
+            <button class="btn-c" onclick="submitRange('C')">C</button>
+            <button class="btn-d" onclick="submitRange('D')">D</button>
+        </div>
+    </div>
+
+    <div id="loading" class="loading">🚀 正在处理中，请稍候...</div>
+
+    <script>
+        // 1. 从 localStorage 获取时间戳
+        const startTs = localStorage.getItem('dp_tagger_range_start');
+        const endTs = localStorage.getItem('dp_tagger_range_end');
+
+        // 2. 检查并显示
+        if (!startTs || !endTs) {
+            document.body.innerHTML = "<h2 style='color:#e74c3c;'>❌ 错误：未检测到完整的区间设定</h2><p>请先在 Rerun 中设置起点和终点。</p>";
+        } else {
+            document.getElementById('start_ts').innerText = startTs;
+            document.getElementById('end_ts').innerText = endTs;
+        }
+
+        // 3. 异步提交函数
+        async function submitRange(score) {
+            const payload = {
+                src_database: "{{ db }}",
+                src_collection: "{{ col }}",
+                dst_database: "{{ db }}",
+                dst_collection: "{{ col }}",
+                score: score,
+                start_timestamp: startTs,
+                end_timestamp: endTs,
+                comment: "Range rated via Web UI"
+            };
+
+            // UI 切换到加载状态
+            document.getElementById('action-area').style.display = 'none';
+            document.getElementById('loading').style.display = 'block';
+
+            try {
+                const response = await fetch('/rate_range', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    alert('✅ 成功处理 ' + result.processed_count + ' 帧！');
+                    // 清除已使用的区间，防止误操作
+                    localStorage.removeItem('dp_tagger_range_start');
+                    localStorage.removeItem('dp_tagger_range_end');
+                    window.close();
+                } else {
+                    alert('❌ 提交失败: ' + (result.detail || '未知错误'));
+                    document.getElementById('action-area').style.display = 'block';
+                    document.getElementById('loading').style.display = 'none';
+                }
+            } catch (error) {
+                alert('❌ 网络请求异常');
+                console.error(error);
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Setting Range...</title>
+</head>
+<body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+    <h2 id="msg" style="color: #2c3e50;">Processing...</h2>
+    
+    <script>
+        // 1. 从 Jinja2 接收变量
+        const key = "{{ key }}";
+        const value = "{{ value }}";
+        const label = "{{ label }}";
+
+        // 2. 写入 LocalStorage
+        localStorage.setItem(key, value);
+        
+        // 3. 反馈并自动关闭
+        const msgEl = document.getElementById('msg');
+        msgEl.innerText = label + " Set Successfully!";
+        msgEl.style.color = "#27ae60";
+
+        // 延迟一小段时间关闭，让用户能看清提示（或者直接关闭）
+        setTimeout(() => {
+            window.close();
+        }, 600); 
+    </script>
+</body>
+</html>

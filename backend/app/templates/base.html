@@ -1,0 +1,22 @@
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        .container { text-align: center; padding: 50px; font-family: sans-serif; }
+        .card { display: inline-block; background: #f8f9fa; padding: 20px; border-radius: 12px; border-left: 5px solid {{ color }}; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2 style="color: {{ color }};">{% block title %}{% endblock %}</h2>
+        <div class="card">
+            {% block content %}{% endblock %}
+        </div>
+        <p>窗口将在 <span id="countdown">{{ countdown }}</span> 秒后关闭</p>
+    </div>
+    <script>
+        let s = {{ countdown }};
+        setInterval(() => { s--; document.getElementById('countdown').innerText = s; if (s<=0) window.close(); }, 1000);
+    </script>
+</body>
+</html>

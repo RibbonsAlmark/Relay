@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+rerun-sdk
+pydantic==2.9.2
+requests
+pymongo==4.8.0
+open3d

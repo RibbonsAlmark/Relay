@@ -1,0 +1,39 @@
+@import './base.css';
+
+#app {
+  /* 修改为 100% 宽度，让 Rerun 铺满 */
+  width: 100%;
+  max-width: 1400px; 
+  margin: 0 auto;
+  padding: 1rem;
+  font-weight: normal;
+}
+
+/* 移除导致样式错乱的媒体查询 */
+@media (min-width: 1024px) {
+  body {
+    /* 删掉 display: flex; 和 place-items: center; */
+    display: block; 
+  }
+
+  #app {
+    /* 删掉 grid-template-columns: 1fr 1fr; */
+    display: block;
+    padding: 0 2rem;
+  }
+}
+
+/* 按钮样式美化 */
+button {
+  background-color: hsla(160, 100%, 37%, 1);
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+button:hover {
+  opacity: 0.8;
+}
