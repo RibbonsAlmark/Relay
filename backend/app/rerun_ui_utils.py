@@ -26,21 +26,47 @@ class RerunInterfaceHelper:
         range_md = RerunInterfaceHelper._build_range_section(ts, actual_host, src_db, src_col)
         single_md = RerunInterfaceHelper._build_single_section(doc, actual_host, src_db, src_col)
         meta_md = RerunInterfaceHelper._build_meta_section(doc, src_db, src_col)
+        minimal_rating_interface_md = RerunInterfaceHelper._minimal_rating_interface(doc, actual_host, src_db, src_col)
 
         parts = [
-            status_md,
-            "---",
-            batch_md,
-            "---",
-            source_md,
-            "---",
-            range_md,
-            "---",
-            single_md,
-            "---",
-            meta_md
+            minimal_rating_interface_md,
         ]
+        # parts = [
+        #     status_md,
+        #     "---",
+        #     batch_md,
+        #     "---",
+        #     source_md,
+        #     "---",
+        #     range_md,
+        #     "---",
+        #     single_md,
+        #     "---",
+        #     meta_md
+        # ]
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _minimal_rating_interface(doc: Dict[str, Any], host: str, db: str, col: str) -> str:
+        source_name = doc.get("info", {}).get("source")
+        current_rating = TaggerLogic.get_current_rating(doc.get("tag"))
+        rating_display = f"## `{current_rating}`" if current_rating != "Unrated" else "*Unrated*"
+        url = f"http://{host}/quick_rate_collection"
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        rating_btn = " &nbsp; | &nbsp; ".join(links)
+        return (
+            "## Data Info\n\n"
+            f"**Database:** `{db}`\n\n"
+            f"**Collection:** `{col}`\n\n"
+            f"**Source:** `{source_name}`\n\n"
+            "---\n"
+            "## Data Quality\n\n"
+            f"**Current Status:**\n{rating_display}\n\n"
+            "---\n"
+            "## Batch Rate\n\n"
+            "> **Tip:** After clicking the rating button, the same score will be applied to all data originating from the same data source. \n\n"
+            f"#### {rating_btn} \n\n"
+        )
 
     @staticmethod
     def _build_status_section(doc: Dict[str, Any], frame_idx: int) -> str:
