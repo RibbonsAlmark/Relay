@@ -1,10 +1,7 @@
 <template>
   <div id="app">
-    <header>
-      <h1>Data Discovery Platform</h1>
-    </header>
     
-    <div class="controls">
+    <!-- <div class="controls">
       <div class="input-group">
         <label>数据库：</label>
         <input 
@@ -60,14 +57,14 @@
           <span class="copy-icon">{{ copied ? '✅' : '📋' }}</span>
         </div>
       </div>
-    </div>
+    </div> -->
 
-    <RerunViewer :source="currentSource" />
+    <RerunViewer v-if="currentSource" :source="currentSource" />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import RerunViewer from './components/RerunViewer.vue';
 import { useRerunStore } from './stores/rerun';
@@ -81,6 +78,18 @@ const selectedDataset = ref('');
 const loading = ref(false);
 const playing = ref(false);
 const copied = ref(false);
+
+// 直接在 setup 顶层运行，不要等到 onMounted
+const params = new URLSearchParams(window.location.search);
+const urlParam = params.get('rerun_url');
+const uuidParam = params.get('source_uuid');
+
+let heartbeatTimer = null; // 用于存储定时器引用
+
+if (urlParam && uuidParam) {
+  // 在组件渲染之前就填入数据
+  rerunStore.setRerunInfo(null, urlParam.trim().replace(/\s+/g, '+'), uuidParam);
+}
 
 // 核心联动：根据选中的数据库计算数据集列表
 const availableDatasets = computed(() => {
@@ -102,18 +111,129 @@ const onDBChange = () => {
   selectedDataset.value = '';
 };
 
-// 页面初始化：加载后端数据库结构
-onMounted(async () => {
+// --- 核心函数：发送心跳 ---
+const sendHeartbeat = async () => {
+  if (!recordingUuid.value) return;
+
   try {
-    const response = await fetch(API_ENDPOINTS.LIST_ALL);
-    const result = await response.json();
-    if (result.status === 'success') {
-      rerunStore.setDbStructure(result.data);
+    // 这里的 API_ENDPOINTS.HEARTBEAT 对应后端 manager.keep_alive 的路由
+    const response = await fetch(API_ENDPOINTS.HEARTBEAT(recordingUuid.value), {
+      method: 'POST'
+    });
+    
+    if (response.ok) {
+      console.log(`[Heartbeat] 续命成功: ${recordingUuid.value}`);
+    } else {
+      console.warn("[Heartbeat] 续命失败，后端可能已回收资源");
     }
   } catch (e) {
-    console.error('API Error:', e);
+    console.error("[Heartbeat] 网络错误:", e);
+  }
+};
+
+// --- 开启心跳循环 ---
+const startHeartbeatLoop = () => {
+  stopHeartbeatLoop(); // 先清理旧的
+  console.log("启动心跳监控...");
+  // 每 60 秒发送一次心跳 (过期时间 180s，60s 非常安全)
+  heartbeatTimer = setInterval(sendHeartbeat, 60000);
+};
+
+// --- 停止心跳循环 ---
+const stopHeartbeatLoop = () => {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+};
+
+// --- 监听 recordingUuid 的变化 ---
+// 当获取到新的录制 ID 时，立即发送一次心跳并开启循环
+watch(recordingUuid, (newId) => {
+  if (newId) {
+    sendHeartbeat(); // 立即执行一次
+    startHeartbeatLoop();
+  } else {
+    stopHeartbeatLoop();
   }
 });
+
+// 页面初始化：加载后端数据库结构
+onMounted(async () => {
+  // 1. 解析 URL 参数 (例如: ?rerun_url=rrd://localhost:9876&source_uuid=123-456)
+  const params = new URLSearchParams(window.location.search);
+  const urlParam = params.get('rerun_url'); // 对应你说的 rerun url
+  const uuidParam = params.get('source_uuid'); // 对应你说的 source uuid
+
+  // 2. 如果存在参数，直接存入 Store
+  // 这会自动触发 RerunViewer 的更新，因为 currentSource 是响应式的
+  if (urlParam || uuidParam) {
+    rerunStore.setRerunInfo(
+      null,        // app_id (如果没有就不传)
+      urlParam,    // connect_url -> 对应 currentSource
+      uuidParam    // recording_uuid
+    );
+    console.log('Detected params:', { urlParam, uuidParam });
+  }
+
+  // // 3. 数据库结构加载逻辑
+  // try {
+  //   const response = await fetch(API_ENDPOINTS.LIST_ALL);
+  //   const result = await response.json();
+  //   if (result.status === 'success') {
+  //     rerunStore.setDbStructure(result.data);
+  //   }
+  // } catch (e) {
+  //   console.error('API Error:', e);
+  // }
+
+  // 如果 URL 里直接带了 UUID，触发心跳
+  if (recordingUuid.value) {
+    sendHeartbeat();
+    startHeartbeatLoop();
+  }
+
+  if (recordingUuid.value) {
+    console.log("正在监控 Rerun 加载进度...");
+    
+    // 关键改变：等资源下载完，而不是等固定秒数
+    await waitForRerunReady(); 
+    
+    console.log("检测到 Viewer 已就绪，正在启动数据流...");
+    await handlePlayData(); 
+  }
+});
+
+const waitForRerunReady = () => {
+  return new Promise((resolve) => {
+    const checkInterval = setInterval(() => {
+      // 获取所有已加载的资源
+      const resources = performance.getEntriesByType('resource');
+      
+      // 寻找 rerun 的核心 Wasm 文件
+      const wasmResource = resources.find(r => 
+        r.name.includes('wasm') || r.name.includes('rerun_viewer')
+      );
+
+      if (wasmResource) {
+        // 只要这个资源出现了，说明下载阶段已完成
+        console.log(`✅ 检测到 Rerun 核心束下载完成: ${wasmResource.name}`);
+        console.log(`耗时: ${(wasmResource.duration / 1000).toFixed(2)}s`);
+        
+        clearInterval(checkInterval);
+        
+        // 下载完后给 1.5s 的“解压与启动”缓冲时间，然后返回
+        setTimeout(resolve, 1500); 
+      }
+    }, 500); // 每 500ms 检查一次
+    
+    // 设置一个 30 秒的极长超时，防止死循环
+    setTimeout(() => {
+      clearInterval(checkInterval);
+      resolve();
+    }, 30000);
+  });
+};
 
 const handleCreateSource = async () => {
   loading.value = true;
@@ -168,11 +288,26 @@ const copyToClipboard = async () => {
 </script>
 
 <style scoped>
-#app { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; color: white; background: #1a1a1a; min-height: 100vh; }
-header h1 { font-size: 1.2rem; color: #888; margin-bottom: 20px; }
+#app { 
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+  color: white; 
+  background: #1a1a1a; 
+  
+  /* 关键修改：让 #app 撑满视口高度 */
+  height: 100vh; 
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* 防止出现双滚动条 */
+}
+
+:deep(.rerun-container) {
+  flex: 1; /* 占据剩余全部高度 */
+}
 
 .controls { 
-  margin-bottom: 20px; display: flex; align-items: center; gap: 15px; 
+  display: flex; 
+  align-items: center; 
+  gap: 15px; 
   background: #252525; padding: 12px 18px; border-radius: 8px; border: 1px solid #333;
 }
 

@@ -73,28 +73,48 @@
             document.getElementById('loading').style.display = 'block';
 
             try {
-                const response = await fetch('/rate_range', {
+                // --- 1. 提交评分请求 ---
+                const rateResponse = await fetch('/rate_range', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
 
-                const result = await response.json();
+                if (rateResponse.ok) {
+                    const result = await rateResponse.json();
+                    
+                    // --- 2. 核心操作：调用已有的 refresh_ui 接口 ---
+                    const uuid = "{{ recording_uuid }}";
+                    if (uuid && uuid !== "None" && uuid !== "") {
+                        console.log("Requesting UI refresh for:", uuid);
+                        
+                        // 注意：这里使用的是你定义的 POST /refresh_ui/{uuid}
+                        try {
+                            await fetch(`/refresh_ui/${uuid}`, {
+                                method: 'POST'
+                            });
+                        } catch (refreshErr) {
+                            console.error("UI Refresh failed but rating was successful:", refreshErr);
+                        }
+                    }
 
-                if (response.ok) {
                     alert('✅ 成功处理 ' + result.processed_count + ' 帧！');
-                    // 清除已使用的区间，防止误操作
+                    
+                    // 清理并关闭
                     localStorage.removeItem('dp_tagger_range_start');
                     localStorage.removeItem('dp_tagger_range_end');
                     window.close();
                 } else {
-                    alert('❌ 提交失败: ' + (result.detail || '未知错误'));
+                    const error = await rateResponse.json();
+                    alert('❌ 提交失败: ' + (error.detail || '未知错误'));
                     document.getElementById('action-area').style.display = 'block';
                     document.getElementById('loading').style.display = 'none';
                 }
             } catch (error) {
                 alert('❌ 网络请求异常');
                 console.error(error);
+                document.getElementById('action-area').style.display = 'block';
+                document.getElementById('loading').style.display = 'none';
             }
         }
     </script>

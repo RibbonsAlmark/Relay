@@ -8,10 +8,17 @@ from ..data_provider import DataManager
 from ..logic.tagger import TaggerLogic
 from fastapi.templating import Jinja2Templates
 from ..service.rating_service import RatingService
+from typing import Optional
+from ..service import session_service
 
 router = APIRouter()
 
 templates = Jinja2Templates(directory="app/templates")
+
+def _try_ui_refresh(uuid: str):
+    if uuid:
+        logger.info(f"评分完成，尝试触发 UI 刷新: {uuid}")
+        session_service.trigger_ui_refresh(uuid)
 
 # --- 1. 单帧打分 (JSON 接口) ---
 @router.post("/rate_frame")
@@ -138,7 +145,8 @@ async def quick_rate(
     frame_id: str = Query(...), 
     score: str = Query(...),
     db: str = Query("db_prod"), 
-    col: str = Query("db_dev")  
+    col: str = Query("db_dev"),
+    recording_uuid: Optional[str] = None
 ):
     client = DataManager.get_client()
     try:
@@ -153,6 +161,8 @@ async def quick_rate(
         frame["tag"] = TaggerLogic.update_rating(frame.get("tag"), score)
         frame["relabel_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         client.write(db, col, [frame])
+
+        _try_ui_refresh(recording_uuid)
         
         return templates.TemplateResponse("rate_single.html", {
             "request": request,
@@ -172,7 +182,8 @@ async def quick_rate_collection(
     request: Request,            # 必须加上 request 参数
     score: str = Query(...), 
     db: str = Query(...), 
-    col: str = Query(...)
+    col: str = Query(...),
+    recording_uuid: Optional[str] = None
 ):
     try:
         # 1. 构造配置并调用逻辑
@@ -186,6 +197,8 @@ async def quick_rate_collection(
         )
         result = await rate_collection(config, None)
         processed_count = result.get("processed_count", 0)
+
+        _try_ui_refresh(recording_uuid)
 
         # 2. 使用 Jinja2 模板返回
         # 这里的 key 名（如 "db", "col"）要和 html 模板里的 {{ db }} 一一对应
@@ -223,12 +236,14 @@ async def set_range_local(
 async def quick_confirm_range(
     request: Request,
     db: str = Query(...),
-    col: str = Query(...)
+    col: str = Query(...),
+    recording_uuid: Optional[str] = None  # 接收来自 Rerun 面板的 UUID
 ):
     return templates.TemplateResponse("rate_range_confirm.html", {
         "request": request,
         "db": db,
-        "col": col
+        "col": col,
+        "recording_uuid": recording_uuid  # 传给 HTML 模板
     })
 
 @router.get("/quick_rate_source")
@@ -237,7 +252,8 @@ async def quick_rate_source(
     db: str = Query(...),
     col: str = Query(...),
     source: str = Query(...),
-    score: str = Query(...)
+    score: str = Query(...),
+    recording_uuid: Optional[str] = None
 ):
     """供 Rerun Markdown 面板直接点击跳转的 HTML 接口"""
     try:
@@ -249,6 +265,8 @@ async def quick_rate_source(
             score=score,
             comment="Rated via Rerun Source Action"
         )
+
+        _try_ui_refresh(recording_uuid)
 
         return templates.TemplateResponse("rate_batch.html", {
             "request": request,

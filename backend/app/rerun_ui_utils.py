@@ -15,57 +15,72 @@ class RerunInterfaceHelper:
         frame_idx: int, 
         backend_host: str = None,
         src_db: str = "",
-        src_col: str = ""
+        src_col: str = "",
+        recording_uuid: str = ""
+    ) -> str:
+        actual_host = backend_host or BACKEND_HOST
+        
+        minimal_rating_interface_md = RerunInterfaceHelper._minimal_rating_interface(doc, actual_host, src_db, src_col, recording_uuid)
+
+        parts = [
+            minimal_rating_interface_md,
+        ]
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def generate_frame_panel_pro(
+        doc: Dict[str, Any], 
+        frame_idx: int, 
+        backend_host: str = None,
+        src_db: str = "",
+        src_col: str = "",
+        recording_uuid: str = ""
     ) -> str:
         actual_host = backend_host or BACKEND_HOST
         ts = str(doc.get("info", {}).get("timestamp") or doc.get("timestamp", "0"))
         
         status_md = RerunInterfaceHelper._build_status_section(doc, frame_idx)
-        batch_md = RerunInterfaceHelper._build_batch_section(actual_host, src_db, src_col)
-        source_md = RerunInterfaceHelper._build_source_section(doc, actual_host, src_db, src_col)
-        range_md = RerunInterfaceHelper._build_range_section(ts, actual_host, src_db, src_col)
-        single_md = RerunInterfaceHelper._build_single_section(doc, actual_host, src_db, src_col)
+        batch_md = RerunInterfaceHelper._build_batch_section(actual_host, src_db, src_col, recording_uuid)
+        source_md = RerunInterfaceHelper._build_source_section(doc, actual_host, src_db, src_col, recording_uuid)
+        range_md = RerunInterfaceHelper._build_range_section(ts, actual_host, src_db, src_col, recording_uuid)
+        single_md = RerunInterfaceHelper._build_single_section(doc, actual_host, src_db, src_col, recording_uuid)
         meta_md = RerunInterfaceHelper._build_meta_section(doc, src_db, src_col)
-        minimal_rating_interface_md = RerunInterfaceHelper._minimal_rating_interface(doc, actual_host, src_db, src_col)
 
         parts = [
-            minimal_rating_interface_md,
+            status_md,
+            "---",
+            batch_md,
+            "---",
+            source_md,
+            "---",
+            range_md,
+            "---",
+            single_md,
+            "---",
+            meta_md
         ]
-        # parts = [
-        #     status_md,
-        #     "---",
-        #     batch_md,
-        #     "---",
-        #     source_md,
-        #     "---",
-        #     range_md,
-        #     "---",
-        #     single_md,
-        #     "---",
-        #     meta_md
-        # ]
         return "\n\n".join(parts)
 
     @staticmethod
-    def _minimal_rating_interface(doc: Dict[str, Any], host: str, db: str, col: str) -> str:
+    def _minimal_rating_interface(doc: Dict[str, Any], host: str, db: str, col: str, uuid: str) -> str:
         source_name = doc.get("info", {}).get("source")
         current_rating = TaggerLogic.get_current_rating(doc.get("tag"))
         rating_display = f"## `{current_rating}`" if current_rating != "Unrated" else "*Unrated*"
         url = f"http://{host}/quick_rate_collection"
-        links = [f"[{s}]({url}?score={s}&db={db}&col={col})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         rating_btn = " &nbsp; | &nbsp; ".join(links)
         return (
-            "## Data Info\n\n"
-            f"**Database:** `{db}`\n\n"
-            f"**Collection:** `{col}`\n\n"
-            f"**Source:** `{source_name}`\n\n"
-            "---\n"
             "## Data Quality\n\n"
             f"**Current Status:**\n{rating_display}\n\n"
             "---\n"
             "## Batch Rate\n\n"
             "> **Tip:** After clicking the rating button, the same score will be applied to all data originating from the same data source. \n\n"
             f"#### {rating_btn} \n\n"
+            "---\n"
+            "## Data Info\n\n"
+            f"**Database:** `{db}`\n\n"
+            f"**Collection:** `{col}`\n\n"
+            f"**Source:** `{source_name}`\n\n"
         )
 
     @staticmethod
@@ -75,14 +90,14 @@ class RerunInterfaceHelper:
         return f"### Quality Grading (Frame {frame_idx})\n**Current Status:**\n{rating_display}"
 
     @staticmethod
-    def _build_batch_section(host: str, db: str, col: str) -> str:
+    def _build_batch_section(host: str, db: str, col: str, uuid: str) -> str:
         """L1: Collection Level"""
         url = f"http://{host}/quick_rate_collection"
-        links = [f"[{s}]({url}?score={s}&db={db}&col={col})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         return "### 📦 Batch Rate (All Frames)\n" + " &nbsp; | &nbsp; ".join(links)
 
     @staticmethod
-    def _build_source_section(doc: Dict[str, Any], host: str, db: str, col: str) -> str:
+    def _build_source_section(doc: Dict[str, Any], host: str, db: str, col: str, uuid: str) -> str:
         """L2: Source/Sequence Level"""
         source_name = doc.get("info", {}).get("source")
         if not source_name:
@@ -90,12 +105,13 @@ class RerunInterfaceHelper:
         
         url = f"http://{host}/quick_rate_source"
         safe_source = quote(str(source_name))
-        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&source={safe_source})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&source={safe_source}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         return f"### 🎞 Sequence Rate (Same Source)\n**Source:** `{source_name}`\n\n" + " &nbsp; | &nbsp; ".join(links)
 
     @staticmethod
-    def _build_range_section(ts: str, host: str, db: str, col: str) -> str:
+    def _build_range_section(ts: str, host: str, db: str, col: str, uuid: str) -> str:
         """L3: Range Level"""
+
         base_url = f"http://{host}/set_range_local"
         
         # 构造标准 URL
@@ -109,7 +125,7 @@ class RerunInterfaceHelper:
         link_end = f"{base_url}?key={RerunInterfaceHelper.LS_KEY_END}&value={ts}&label={end_label}"
         
         # 执行按钮：跳转到确认页
-        link_exec = f"http://{host}/quick_confirm_range?db={db}&col={col}"
+        link_exec = f"http://{host}/quick_confirm_range?db={db}&col={col}&recording_uuid={uuid}"
 
         lines = [
             "### 🛠 Range Rate (Selected Interval)",
@@ -124,11 +140,11 @@ class RerunInterfaceHelper:
         return "\n".join(lines)
 
     @staticmethod
-    def _build_single_section(doc: Dict[str, Any], host: str, db: str, col: str) -> str:
+    def _build_single_section(doc: Dict[str, Any], host: str, db: str, col: str, uuid: str) -> str:
         """L4: Single Frame Level"""
         url = f"http://{host}/quick_rate"
         fid = quote(str(doc.get("_id", "unknown")))
-        links = [f"[{s}]({url}?frame_id={fid}&score={s}&db={db}&col={col})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        links = [f"[{s}]({url}?frame_id={fid}&score={s}&db={db}&col={col}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         return "### 🎯 Single Rate (Current Frame)\n" + " &nbsp; | &nbsp; ".join(links)
 
     @staticmethod

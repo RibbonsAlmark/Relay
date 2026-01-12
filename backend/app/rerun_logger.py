@@ -1,6 +1,8 @@
 import rerun as rr
-import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Type, Optional
+from loguru import logger
+
+# 导入具体的处理器类
 from .processors.ui_processor import UIProcessor
 from .processors.image_processor import ImageProcessor
 from .processors.joint_processor import JointProcessor
@@ -8,74 +10,48 @@ from .processors.pose_processor import PoseProcessor
 from .processors.lidar_processor import LidarProcessor
 
 class RerunLogger:
-    PROCESSORS = [
-        UIProcessor(),
-        ImageProcessor(),
-        JointProcessor(),
-        PoseProcessor(),
-        LidarProcessor()
+    # 存储类引用，而不是实例对象
+    DEFAULT_PROCESSOR_CLASSES = [
+        UIProcessor,
+        ImageProcessor,
+        JointProcessor,
+        PoseProcessor,
+        LidarProcessor
     ]
     
     @staticmethod
-    def compute_frame_payload(doc: Dict[str, Any], frame_idx: int, **kwargs) -> Dict[str, Any]:
+    def compute_frame_payload(
+        doc: Dict[str, Any], 
+        frame_idx: int, 
+        processor_classes: Optional[List[Type]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
-        这是被 ThreadPoolExecutor 调用的核心函数
+        被 ThreadPoolExecutor 调用的核心计算函数。
+        
+        Args:
+            doc: 原始数据字典
+            frame_idx: 当前帧索引
+            processor_classes: 指定要运行的处理器类列表。若为 None，则运行 DEFAULT_PROCESSOR_CLASSES。
+            **kwargs: 传递给处理器的额外参数（如 src_db, src_col）
         """
+        # 决定本次计算使用哪些处理器
+        target_classes = processor_classes if processor_classes is not None else RerunLogger.DEFAULT_PROCESSOR_CLASSES
+        
         frame_payload = {}
-        for processor in RerunLogger.PROCESSORS:
+        
+        for proc_cls in target_classes:
             try:
-                # 每一个处理器现在都返回 Dict[str, Any]
+                # 【关键】动态实例化处理器，确保每个线程拥有独立的处理器对象，线程安全
+                processor = proc_cls()
+                
+                # 迭代 Generator 获取该处理器的所有组件
                 results = processor.process(doc, frame_idx=frame_idx, **kwargs)
-                if results:
-                    # 将所有组件合并到一个大的 payload 字典中
-                    frame_payload.update(results)
+                for path, component in results:
+                    frame_payload[path] = component
+                    
             except Exception as e:
-                print(f"Processor {processor.__class__.__name__} failed: {e}")
+                # 使用 loguru 记录错误，比 print 更利于调试
+                logger.error(f"Processor {proc_cls.__name__} failed at frame {frame_idx}: {e}")
+                
         return frame_payload
-
-# import rerun as rr
-# from typing import Dict, Any, List
-# from .processors.ui_processor import UIProcessor
-# from .processors.image_processor import ImageProcessor
-# from .processors.joint_processor import JointProcessor
-# from .processors.pose_processor import PoseProcessor
-# from .processors.lidar_processor import LidarProcessor
-
-# class RerunLogger:
-#     # 静态初始化处理器列表
-#     # 将来增加传感器只需在这里 append 一个实例
-#     PROCESSORS = [
-#         UIProcessor(),
-#         ImageProcessor(),
-#         JointProcessor(),
-#         PoseProcessor(),
-#         LidarProcessor(),
-#     ]
-    
-#     @staticmethod
-#     def log_frame_to_stream(
-#         stream: rr.RecordingStream, 
-#         doc: Dict[str, Any], 
-#         frame_idx: int,
-#         src_db: str = "",
-#         src_col: str = ""
-#     ):
-#         """
-#         通过分发逻辑到各个处理器来推送数据
-#         """
-#         # 1. 设置全局时间轴
-#         stream.set_time("frame_idx", sequence=frame_idx)
-
-#         # 2. 调度所有已注册的处理器
-#         for processor in RerunLogger.PROCESSORS:
-#             try:
-#                 processor.process(
-#                     stream, 
-#                     doc, 
-#                     frame_idx=frame_idx, 
-#                     src_db=src_db, 
-#                     src_col=src_col
-#                 )
-#             except Exception as e:
-#                 # 单个处理器崩溃不影响其他数据展示
-#                 print(f"Processor {processor.__class__.__name__} failed: {e}")

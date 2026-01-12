@@ -3,9 +3,7 @@
 #app {
   /* 修改为 100% 宽度，让 Rerun 铺满 */
   width: 100%;
-  max-width: 1400px; 
   margin: 0 auto;
-  padding: 1rem;
   font-weight: normal;
 }
 
@@ -19,7 +17,6 @@
   #app {
     /* 删掉 grid-template-columns: 1fr 1fr; */
     display: block;
-    padding: 0 2rem;
   }
 }
 

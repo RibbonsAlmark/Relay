@@ -34,10 +34,13 @@ const viewerUrl = computed(() => {
 <style scoped>
 .rerun-container {
   width: 100%;
-  height: 80vh; /* 根据需求调整高度 */
-  border: 1px solid #444;
-  border-radius: 8px;
+  height: 100%; /* 从 80vh 改为 100%，跟随父级 flex: 1 的高度 */
+  border: none; /* 既然全屏了，可以考虑去掉边框更美观 */
   overflow: hidden;
   background-color: #111;
+}
+
+iframe {
+  display: block; /* 消除 iframe 下方微小的空白间隙 */
 }
 </style>

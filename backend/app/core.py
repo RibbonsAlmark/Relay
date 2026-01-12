@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures
 from typing import Dict, Set
 from loguru import logger
+import psutil
+import os
 
 from .data_provider import DataManager
 from .rerun_logger import RerunLogger
@@ -42,172 +44,295 @@ class RerunSession:
         self.port_manager = port_manager
         self.app_id = f"{dataset}/{collection}"
         
-        # 生成录制 ID
+        # 1. 生成录制 ID
         timestamp_str = time.strftime("%Y%m%d-%H%M%S")
-        self.recording_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{self.app_id}/{timestamp_str}/{uuid.uuid4()}"))
+        self.recording_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{self.app_id}/{timestamp_str}"))
         
         self.port = self.port_manager.acquire()
+        
+        # 2. 状态控制变量
         self.is_playing = False
         self.has_started = False
+        self.is_dead = False 
+        self.play_lock = threading.Lock()
+        self.stop_signal = threading.Event() 
+        
+        # --- 【背压控制】 ---
+        self.log_queue = queue.Queue(maxsize=32)
+        self.max_frame_idx = 0 
+        
         self.created_at = time.time()
+        self.last_heartbeat = time.time()
 
-        # 启动独立流
+        # 3. 启动 Rerun 流
         self.stream = rr.RecordingStream(
             application_id=self.app_id,
             recording_id=self.recording_uuid,
             make_default=False
         )
-        # 绑定 0.0.0.0 并增大缓冲区
-        self.stream.serve_grpc(grpc_port=self.port, server_memory_limit="1GB")
 
-    import queue
+        # 持久化执行器，workers 为 CPU 核心数的 2 倍左右以应对 I/O 和计算混合
+        self.process_executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
+
+        # 内存限制 10MB
+        memory_limit = "10MB"
+        self.stream.serve_grpc(grpc_port=self.port, server_memory_limit=memory_limit)
+        
+        logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
+
+    def heartbeat(self):
+        """外部调用此方法续命"""
+        self.last_heartbeat = time.time()
+
+    def push_frames(self, frames: list, start_idx: int = 0):
+        """
+        对外数据推送接口：支持历史覆盖、增量追加与精确插入。
+        
+        该接口具备“背压感知”功能。若队列填满，调用线程将阻塞直至空间释放，确保数据不丢失。
+        
+        Args:
+            frames (list): 待发送的原始数据帧列表。
+            start_idx (int): 插入起始索引。
+                - 0 : 从时间轴起点开始（默认）。
+                - n : 从第 n 帧开始。
+                - -1: 从当前已知的末尾追加（Last + 1）。
+                - -n: 从末尾向前偏移（例如 -2 代表从倒数第二帧位置开始覆盖）。
+
+        Returns:
+            bool: 推送任务是否成功进入管道。
+        """
+        if self.is_dead:
+            logger.warning(f"[{self.recording_uuid}] 尝试向已销毁的 Session 推送数据")
+            return False
+
+        # --- 1. 索引逻辑转换 (Pythonic Indexing) ---
+        with self.play_lock:
+            if start_idx >= 0:
+                # 绝对位置
+                base_idx = start_idx
+            else:
+                # 负数索引逻辑：-1 为末尾追加，-2 为倒数第二帧偏移
+                base_idx = max(0, self.max_frame_idx + start_idx + 1)
+            
+            # 更新逻辑指针
+            count = len(frames)
+            if base_idx + count > self.max_frame_idx:
+                self.max_frame_idx = base_idx + count
+
+        # --- 2. 异步任务定义 (生产者) ---
+        def _async_task(frame_data, idx):
+            # 及时检查生命周期，防止无效计算
+            if self.is_dead or self.stop_signal.is_set():
+                return
+            try:
+                # 执行耗时的 Processor 计算（在独立的工作线程中并行）
+                payload = RerunLogger.compute_frame_payload(
+                    frame_data, idx, 
+                    src_db=self.dataset, src_col=self.collection,
+                    recording_uuid=self.recording_uuid
+                )
+                # 阻塞入队：实现背压的核心
+                # 如果 log_queue 满了，工作线程会在此等待，间接拖慢 process_executor
+                self.log_queue.put((idx, payload), block=True)
+            except Exception as e:
+                logger.error(f"Async Task Error at frame {idx}: {e}")
+
+        # --- 3. 提交至常驻线程池 ---
+        # 瞬间提交所有帧，不阻塞主线程，实现 I/O 与计算的分离
+        try:
+            for i, frame in enumerate(frames):
+                self.process_executor.submit(_async_task, frame, base_idx + i)
+            return True
+        except Exception as e:
+            logger.error(f"[{self.recording_uuid}] 异步任务提交失败: {e}")
+            return False
 
     def play_logic(self):
-        """完全异步管线：分发即释放，计算完自动排队"""
-        try:
+        # --- A. 抢占与重置逻辑 (略，保持你现在的代码即可) ---
+        if self.is_playing:
+            self.stop_signal.set()
+            wait_start = time.time()
+            while self.is_playing and (time.time() - wait_start < 2.0):
+                time.sleep(0.1)
+        self.stop_signal.clear()
+        while not self.log_queue.empty():
+            try: self.log_queue.get_nowait()
+            except: break
+
+        with self.play_lock:
             self.is_playing = True
-            self.has_started = True
-            # 有界队列，作为“背压”控制内存
-            log_queue = queue.Queue(maxsize=32)
+            self.max_frame_idx = 0
 
-            # --- 1. 发送者线程 ---
+        try:
+            # --- B. 启动发送者线程 (Consumer) ---
             def sender_loop():
-                while self.is_playing or not log_queue.empty():
-                    try:
-                        idx, payload = log_queue.get(timeout=1.0)
-                        self.stream.set_time("frame_idx", sequence=idx)
-                        for path, component in payload.items():
-                            self.stream.log(path, component)
-                        log_queue.task_done()
-                    except queue.Empty:
-                        continue
-
-            sender_thread = threading.Thread(target=sender_loop, daemon=True)
-            sender_thread.start()
-
-            # --- 2. 异步回调函数 ---
-            def on_compute_done(future, idx):
+                logger.info(f"[{self.recording_uuid}] Sender Loop 已启动")
                 try:
-                    payload = future.result()
-                    # 计算完成，直接塞入队列。如果队列满，计算线程会在此稍作等待
-                    log_queue.put((idx, payload))
-                except Exception as e:
-                    logger.error(f"Frame {idx} computation failed: {e}")
+                    while not self.stop_signal.is_set() or not self.log_queue.empty():
+                        try:
+                            item = self.log_queue.get(timeout=0.5)
+                            idx, payload = item
+                            self.stream.set_time("frame_idx", sequence=idx)
+                            for path, component in payload.items():
+                                self.stream.log(path, component)
+                            self.log_queue.task_done()
+                        except queue.Empty:
+                            continue
+                finally:
+                    logger.info(f"[{self.recording_uuid}] Sender Loop 已关闭")
 
-            # --- 3. 生产者 (主线程) ---
+            threading.Thread(target=sender_loop, daemon=True).start()
+
+            # --- C. 推送历史数据 (Producer) ---
+            logger.info(f"[{self.recording_uuid}] 开始全速流水线加载...")
             frames_iter = DataManager.fetch_frames_iter(self.dataset, self.collection)
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                for i, frame in enumerate(frames_iter):
-                    # 【核心改变】：不使用 .result() 阻塞，而是绑定回调
-                    future = executor.submit(
-                        RerunLogger.compute_frame_payload,
-                        frame, i,
-                        src_db=self.dataset, src_col=self.collection
-                    )
-                    # 关键点：将当前的序号 i 绑定到回调函数中
-                    future.add_done_callback(lambda f, idx=i: on_compute_done(f, idx))
-                    
-                    # 维持输入节奏，防止瞬间把成千上万个任务丢进线程池
-                    time.sleep(0.015) # 稍微快于 50fps，给缓冲留余地
-
-            print(f"[{self.recording_uuid}] All tasks dispatched.")
+            batch = []
+            batch_size = 15 # 增大 Batch，喂饱线程池
             
+            for i, doc in enumerate(frames_iter):
+                if self.stop_signal.is_set() or self.is_dead: 
+                    logger.info(f"[{self.recording_uuid}] 检测到 Session 销毁，停止读取数据")
+                    break
+                if self.stop_signal.is_set(): break
+                batch.append(doc)
+                
+                if len(batch) >= batch_size:
+                    # 批量提交任务，不阻塞
+                    self.push_frames(batch, start_idx=i - (len(batch) - 1))
+                    batch = []
+                
+                # 提示：移除 time.sleep(0.01)，靠 log_queue 的 Block 特性自动限速
+
+            # 处理末尾残余
+            if batch and not self.stop_signal.is_set():
+                self.push_frames(batch, start_idx=i - (len(batch) - 1))
+
+            # --- D. 维持 Session 存活 ---
+            while not self.stop_signal.is_set() and not self.is_dead:
+                time.sleep(1.0)
+
         except Exception as e:
-            logger.error(f"Pipeline error: {e}")
+            logger.error(f"[{self.recording_uuid}] play_logic 异常: {e}")
         finally:
-            # 这里的优雅关闭逻辑需要注意：
-            # 需要等待 executor 里的任务全部分发完并执行完回调
-            self.is_playing = False 
-            sender_thread.join(timeout=5)
-            self.cleanup()
+            with self.play_lock:
+                self.is_playing = False
+
+    def _execute_recompute_pipeline(self, processor_classes: list, label: str):
+        if self.is_dead: return
+        
+        logger.info(f"[{self.recording_uuid}] 启动异步重计算: {label}")
+
+        # 移除 limit 参数，直接获取全部数据迭代器
+        frames_iter = DataManager.fetch_frames_iter(
+            self.dataset, 
+            self.collection
+        )
+
+        def _task(frame_data, idx):
+            if self.is_dead or self.stop_signal.is_set(): return
+            try:
+                # 【关键修复】确保显式传入 frame_idx 参数
+                payload = RerunLogger.compute_frame_payload(
+                    doc=frame_data,        # 对应 doc
+                    frame_idx=idx,         # 对应 frame_idx (之前可能写成了 idx 或者漏传了)
+                    processor_classes=processor_classes,
+                    src_db=self.dataset, 
+                    src_col=self.collection,
+                    recording_uuid=self.recording_uuid
+                )
+                
+                # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
+                self.log_queue.put((idx, payload), block=True)
+                
+            except Exception as e:
+                logger.error(f"[{label}] 帧 {idx} 任务失败: {e}")
+
+        for i, doc in enumerate(frames_iter):
+            if self.stop_signal.is_set(): break
+            self.process_executor.submit(_task, doc, i)
     
-    # def play_logic(self):
-    #     """优化后的回放逻辑：动态时间补偿"""
-    #     try:
-    #         self.is_playing = True
-    #         self.has_started = True
-    #         print(f"[{self.recording_uuid}] 开始全量推送数据 (Port: {self.port})")
-            
-    #         frames_iter = DataManager.fetch_frames_iter(self.dataset, self.collection)
-            
-    #         # 设置目标帧间隔 (0.02s = 50 FPS)
-    #         TARGET_FRAME_TIME = 0.02 
-
-    #         for i, frame in enumerate(frames_iter):
-    #             frame_start = time.perf_counter()
-                
-    #             # 执行推送 (包含图片压缩、JSON 转换等 IO/CPU 耗时操作)
-    #             RerunLogger.log_frame_to_stream(
-    #                 self.stream, 
-    #                 frame, 
-    #                 frame_idx=i,
-    #                 src_db=self.dataset, 
-    #                 src_col=self.collection
-    #             )
-                
-    #             if i % 50 == 0:
-    #                 print(f"[{self.recording_uuid}] 已推送 {i} 帧...")
-                
-    #             # 计算本次推送实际耗时
-    #             elapsed = time.perf_counter() - frame_start
-    #             # 动态计算剩余需要等待的时间，确保整体频率平滑
-    #             sleep_time = max(0.001, TARGET_FRAME_TIME - elapsed)
-    #             time.sleep(sleep_time)
-                
-    #         print(f"[{self.recording_uuid}] 推送完成。")
-    #     except Exception as e:
-    #         print(f"[{self.recording_uuid}] 推送异常: {e}")
-    #     finally:
-    #         self.is_playing = False
-    #         # 留出时间让 Rerun 缓冲区排空到 Viewer
-    #         time.sleep(3)
-    #         self.cleanup()
-
     def cleanup(self):
+        if self.is_dead: 
+            return
         try:
+            self.is_dead = True
+            # 通知 play_logic 线程停止工作
+            self.stop_signal.set() 
+            # 断开 Rerun 连接
+            self.process_executor.shutdown(wait=False, cancel_futures=True)
             self.stream.disconnect()
         finally:
             self.port_manager.release(self.port)
-            print(f"[{self.recording_uuid}] 资源回收完毕。")
+            logger.info(f"[{self.recording_uuid}] 资源已释放，端口 {self.port} 已回收。")
 
 class RerunSessionManager:
-    def __init__(self, max_workers: int = 20, timeout_seconds: int = 300):
+    def __init__(self, max_workers: int = 20, timeout_seconds: int = 180):
         self.sessions: Dict[str, RerunSession] = {}
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.port_manager = PortManager()
         self.timeout_seconds = timeout_seconds
 
+        self.max_memory_percent = 85  # 内存超过 85% 开始激进清理
+        self.max_cpu_percent = 90     # CPU 超过 90% 限制新 Session
+
         self.monitor_thread = threading.Thread(target=self._monitor, daemon=True)
         self.monitor_thread.start()
 
     def _monitor(self):
+        """全局监控：根据系统负载动态调整 Session 生命周期"""
         while True:
             time.sleep(10)
             now = time.time()
+            
+            # 获取当前系统负载
+            mem_usage = psutil.virtual_memory().percent
+            cpu_usage = psutil.cpu_percent(interval=1)
+            
             with self.lock:
-                to_del = [uid for uid, s in self.sessions.items() 
-                          if not s.has_started and (now - s.created_at) > self.timeout_seconds]
-                for uid in to_del:
-                    self.sessions.pop(uid).cleanup()
+                # 1. 基础清理：心跳超时的必须死
+                to_cleanup = [uid for uid, s in self.sessions.items() 
+                             if (now - s.last_heartbeat) > self.timeout_seconds]
+                
+                # 2. 动态清理：如果内存压力大，强制缩短不活跃 Session 的寿命
+                if mem_usage > self.max_memory_percent:
+                    logger.warning(f"系统内存高位 ({mem_usage}%)，启动激进清理...")
+                    # 额外清理那些超过 30 秒没心跳的（即便没到 180 秒阈值）
+                    for uid, s in self.sessions.items():
+                        if uid not in to_cleanup and (now - s.last_heartbeat) > 30:
+                            to_cleanup.append(uid)
+                
+                for uid in to_cleanup:
+                    session = self.sessions.pop(uid, None)
+                    if session:
+                        session.cleanup()
 
     def create_session(self, dataset: str, collection: str) -> RerunSession:
+        """根据 CPU 负载决定是否允许创建新 Session"""
+        cpu_usage = psutil.cpu_percent()
+        if cpu_usage > self.max_cpu_percent:
+            # 如果 CPU 已经爆了，直接拒绝新连接，保护现有用户
+            raise Exception(f"服务器负载过高 ({cpu_usage}%)，请稍后再试")
+
         session = RerunSession(dataset, collection, self.port_manager)
         with self.lock:
             self.sessions[session.recording_uuid] = session
         return session
 
+    def keep_alive(self, recording_uuid: str):
+        """暴露给 API 层调用的心跳接口"""
+        with self.lock:
+            session = self.sessions.get(recording_uuid)
+            if session:
+                session.heartbeat()
+                return True
+        return False
+
     def start_playback(self, recording_uuid: str):
         with self.lock:
             session = self.sessions.get(recording_uuid)
-            if session and not session.is_playing:
-                future = self.executor.submit(session.play_logic)
-                future.add_done_callback(lambda f: self._remove_from_map(recording_uuid))
-
-    def _remove_from_map(self, recording_uuid: str):
-        with self.lock:
-            if recording_uuid in self.sessions:
-                del self.sessions[recording_uuid]
+            if session:
+                self.executor.submit(session.play_logic)
 
 manager = RerunSessionManager()

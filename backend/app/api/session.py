@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from ..schemas import CreateSourceConfig, SourceResponse
 from ..core import manager
 from ..config import BACKEND_IP
+from ..service import session_service
 from loguru import logger
 
 router = APIRouter()
@@ -50,3 +51,43 @@ async def list_sessions():
             } 
             for uuid, sess in manager.sessions.items()
         }
+
+@router.post("/heartbeat/{recording_uuid}")
+async def heartbeat(recording_uuid: str):
+    """
+    接收心跳，延长 Session 的生命周期
+    """
+    # 调用核心层的 heartbeat() 更新时间戳
+    success = manager.keep_alive(recording_uuid)
+    
+    if not success:
+        # 如果返回 False，说明 Manager 里的字典确实没有这个 UUID 了（可能已被清理）
+        logger.warning(f"Heartbeat failed: Session {recording_uuid} not found.")
+        raise HTTPException(
+            status_code=404, 
+            detail="Session not found or already expired"
+        )
+    
+    return {
+        "status": "alive",
+        "recording_uuid": recording_uuid,
+        "server_time": time.time()
+    }
+
+@router.post("/refresh_ui/{recording_uuid}")
+async def refresh_ui(recording_uuid: str):
+    """
+    单独触发 UI 组件的刷新（不重新加载点云和图像）
+    """
+    success = session_service.trigger_ui_refresh(recording_uuid)
+    if not success:
+        raise HTTPException(
+            status_code=404, 
+            detail="Session not found or expired"
+        )
+    
+    return {
+        "status": "ui_refresh_triggered",
+        "recording_uuid": recording_uuid,
+        "timestamp": time.time()
+    }
