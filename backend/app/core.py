@@ -71,12 +71,19 @@ class RerunSession:
             make_default=False
         )
 
-        # 持久化执行器，workers 为 CPU 核心数的 2 倍左右以应对 I/O 和计算混合
+        # 1. 顺序任务执行器：只有一个 worker，保证任务“先入先出”
+        # 所有的 PoseProcessor 任务都提交到这里，它们会排队，绝不超车
+        self.seq_executor = ThreadPoolExecutor(max_workers=1)
+        
+        # 2. 并发执行器：处理耗时任务（图像、点云等）
         self.process_executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
 
         # 内存限制 10MB
         memory_limit = "10MB"
         self.stream.serve_grpc(grpc_port=self.port, server_memory_limit=memory_limit)
+
+        # 线程锁
+        self.log_lock = threading.Lock()
         
         logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
 
@@ -140,13 +147,54 @@ class RerunSession:
         # --- 3. 提交至常驻线程池 ---
         # 瞬间提交所有帧，不阻塞主线程，实现 I/O 与计算的分离
         try:
-            for i, frame in enumerate(frames):
-                self.process_executor.submit(_async_task, frame, base_idx + i)
+            for i, frame_data in enumerate(frames):
+                idx = base_idx + i
+                
+                # --- 分支 A: 顺序支流 ---
+                # 仅仅是提交任务，瞬间完成，不阻塞读取
+                self.seq_executor.submit(self._seq_task_handler, frame_data, idx)
+
+                # --- 分支 B: 异步支流 ---
+                # 依然由多线程池全速计算图像
+                self.process_executor.submit(self._async_task_handler, frame_data, idx)
+            
             return True
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] 异步任务提交失败: {e}")
             return False
 
+    def _seq_task_handler(self, frame_data, idx):
+        """这个函数由于在 max_workers=1 的线程池运行，天然具备顺序性"""
+        if self.is_dead or self.stop_signal.is_set(): return
+        try:
+            # 只提取顺序数据 (Pose, Axes 等)
+            payload = RerunLogger.compute_sequential_payload(
+                frame_data, idx, 
+                src_db=self.dataset, src_col=self.collection
+            )
+            if payload:
+                with self.log_lock:
+                    self.stream.set_time("frame_idx", sequence=idx)
+                    for path, comp in payload.items():
+                        self.stream.log(path, *(comp if isinstance(comp, list) else [comp]))
+        except Exception as e:
+            logger.error(f"Sequential Task Error at frame {idx}: {e}")
+
+    def _async_task_handler(self, frame_data, idx):
+        """在多线程池运行，处理图像等耗时项"""
+        if self.is_dead or self.stop_signal.is_set(): return
+        try:
+            # 只提取异步数据 (Image 等)
+            payload = RerunLogger.compute_async_payload(
+                frame_data, idx, 
+                src_db=self.dataset, src_col=self.collection
+            )
+            if payload:
+                # 计算完后塞进队列，由 sender_loop 补发图像
+                self.log_queue.put((idx, payload), block=True)
+        except Exception as e:
+            logger.error(f"Async Task Error at frame {idx}: {e}")
+    
     def play_logic(self):
         # --- A. 抢占与重置逻辑 (略，保持你现在的代码即可) ---
         if self.is_playing:
@@ -172,9 +220,13 @@ class RerunSession:
                         try:
                             item = self.log_queue.get(timeout=0.5)
                             idx, payload = item
-                            self.stream.set_time("frame_idx", sequence=idx)
-                            for path, component in payload.items():
-                                self.stream.log(path, component)
+                            with self.log_lock:
+                                self.stream.set_time("frame_idx", sequence=idx)
+                                for path, component in payload.items():
+                                    if isinstance(component, list):
+                                        self.stream.log(path, *component)
+                                    else:
+                                        self.stream.log(path, component)
                             self.log_queue.task_done()
                         except queue.Empty:
                             continue

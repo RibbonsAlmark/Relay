@@ -19,39 +19,31 @@ class RerunLogger:
         LidarProcessor
     ]
     
-    @staticmethod
-    def compute_frame_payload(
-        doc: Dict[str, Any], 
-        frame_idx: int, 
-        processor_classes: Optional[List[Type]] = None,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """
-        被 ThreadPoolExecutor 调用的核心计算函数。
-        
-        Args:
-            doc: 原始数据字典
-            frame_idx: 当前帧索引
-            processor_classes: 指定要运行的处理器类列表。若为 None，则运行 DEFAULT_PROCESSOR_CLASSES。
-            **kwargs: 传递给处理器的额外参数（如 src_db, src_col）
-        """
-        # 决定本次计算使用哪些处理器
-        target_classes = processor_classes if processor_classes is not None else RerunLogger.DEFAULT_PROCESSOR_CLASSES
-        
-        frame_payload = {}
-        
-        for proc_cls in target_classes:
-            try:
-                # 【关键】动态实例化处理器，确保每个线程拥有独立的处理器对象，线程安全
-                processor = proc_cls()
+    @classmethod
+    def compute_sequential_payload(cls, doc: Dict[str, Any], frame_idx: int, **kwargs) -> Dict[str, Any]:
+        """专门提取需要顺序发送的强时序数据 (is_sequential=True)"""
+        return cls._compute_by_filter(doc, frame_idx, True, **kwargs)
+
+    @classmethod
+    def compute_async_payload(cls, doc: Dict[str, Any], frame_idx: int, **kwargs) -> Dict[str, Any]:
+        """专门提取可以异步并行处理的数据 (is_sequential=False)"""
+        return cls._compute_by_filter(doc, frame_idx, False, **kwargs)
+
+    @classmethod
+    def _compute_by_filter(cls, doc: Dict[str, Any], frame_idx: int, target_is_seq: bool, **kwargs) -> Dict[str, Any]:
+        """内部通用过滤计算函数"""
+        payload = {}
+        for proc_cls in cls.DEFAULT_PROCESSOR_CLASSES:
+            # 过滤逻辑
+            is_seq = getattr(proc_cls, 'is_sequential', False)
+            if is_seq != target_is_seq:
+                continue
                 
-                # 迭代 Generator 获取该处理器的所有组件
+            try:
+                processor = proc_cls()
                 results = processor.process(doc, frame_idx=frame_idx, **kwargs)
                 for path, component in results:
-                    frame_payload[path] = component
-                    
+                    payload[path] = component
             except Exception as e:
-                # 使用 loguru 记录错误，比 print 更利于调试
                 logger.error(f"Processor {proc_cls.__name__} failed at frame {frame_idx}: {e}")
-                
-        return frame_payload
+        return payload

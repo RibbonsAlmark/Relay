@@ -6,6 +6,9 @@ from typing import Dict, Any, Generator, Tuple
 from .base import BaseProcessor
 
 class LidarProcessor(BaseProcessor):
+    # 开启强顺序模式，解决位姿抖动
+    is_sequential = False
+
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         """
         点云处理：流式解析 PCD 文件。

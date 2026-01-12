@@ -5,6 +5,9 @@ from ..rerun_ui_utils import RerunInterfaceHelper
 from ..config import BACKEND_HOST
 
 class UIProcessor(BaseProcessor):
+    # 开启强顺序模式，解决位姿抖动
+    is_sequential = False
+
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         """
         生成 Markdown 面板：流式返回 TextDocument 组件。

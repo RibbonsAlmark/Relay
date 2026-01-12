@@ -3,6 +3,9 @@ from typing import Dict, Any, Generator, Tuple
 from .base import BaseProcessor
 
 class JointProcessor(BaseProcessor):
+    # 开启强顺序模式，解决位姿抖动
+    is_sequential = False
+
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         """
         处理关节状态数据，并以迭代器形式返回 Rerun 标量组件。
