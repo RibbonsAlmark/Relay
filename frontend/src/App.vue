@@ -69,6 +69,7 @@ import { storeToRefs } from 'pinia';
 import RerunViewer from './components/RerunViewer.vue';
 import { useRerunStore } from './stores/rerun';
 import { API_ENDPOINTS } from './config';
+import { ElNotification } from 'element-plus'; 
 
 const rerunStore = useRerunStore();
 const { recordingUuid, currentSource } = storeToRefs(rerunStore);
@@ -209,6 +210,15 @@ onMounted(async () => {
     await waitForRerunReady(); 
     
     console.log("检测到 Viewer 已就绪，正在启动数据流...");
+
+    ElNotification({
+      title: '加载成功',
+      message: 'Rerun Viewer 已就绪，正在启动数据传输流...',
+      type: 'success',
+      position: 'bottom-right',
+      duration: 3000 // 3秒后自动关闭
+    });
+
     await handlePlayData(); 
   }
 });
@@ -267,9 +277,24 @@ const handlePlayData = async () => {
   if (!recordingUuid.value) return;
   playing.value = true;
   try {
-    await await fetch(API_ENDPOINTS.PLAY_DATA(recordingUuid.value), {method: 'POST'});
+    const response = await fetch(API_ENDPOINTS.PLAY_DATA(recordingUuid.value), { method: 'POST' });
+    if (response.ok) {
+        // 数据真正开始流动的反馈
+        ElNotification({
+          title: '传输中',
+          message: '数据流已连接，正在同步 Frame 序列',
+          type: 'info',
+          position: 'bottom-right',
+          duration: 2000
+        });
+    }
   } catch (e) {
-    alert('数据传输启动失败');
+    ElNotification({
+      title: '传输失败',
+      message: '无法启动后端数据传输，请检查网络或后端状态',
+      type: 'error',
+      position: 'bottom-right'
+    });
   } finally {
     playing.value = false;
   }
