@@ -26,7 +26,7 @@ const props = defineProps({
 // 构建 Rerun Web Viewer 的 URL
 // 我们利用官方托管的 app.rerun.io，并通过 url 参数传递数据源
 const viewerUrl = computed(() => {
-  const baseUrl = 'http://192.168.18.104:9092/';
+  const baseUrl = import.meta.env.VITE_RERUN_VIEWER_BASE || 'http://localhost:9092/';
   return `${baseUrl}?url=${encodeURIComponent(props.source)}`;
 });
 </script>

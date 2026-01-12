@@ -59,7 +59,7 @@
       </div>
     </div> -->
 
-    <RerunViewer v-if="currentSource" :source="currentSource" />
+    <RerunViewer v-if="isInitialized" :source="currentSource" />
   </div>
 </template>
 
@@ -84,12 +84,21 @@ const params = new URLSearchParams(window.location.search);
 const urlParam = params.get('rerun_url');
 const uuidParam = params.get('source_uuid');
 
+const isInitialized = ref(false);
+
 let heartbeatTimer = null; // 用于存储定时器引用
 
 if (urlParam && uuidParam) {
-  // 在组件渲染之前就填入数据
   rerunStore.setRerunInfo(null, urlParam.trim().replace(/\s+/g, '+'), uuidParam);
+} else {
+  // 如果没有参数，也给 Store 塞个空值，防止组件内部报错
+  rerunStore.setRerunInfo(null, "", "");
 }
+
+isInitialized.value = true;
+
+// 标记初始化完成
+isInitialized.value = true;
 
 // 核心联动：根据选中的数据库计算数据集列表
 const availableDatasets = computed(() => {
