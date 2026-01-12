@@ -1,10 +1,14 @@
 import requests
 import json
 from loguru import logger
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
 def test_rate_range_api():
     # 1. 配置参数
-    BASE_URL = "http://127.0.0.1:8000"  # 请根据你实际运行的端口修改
+    BASE_URL = f"http://127.0.0.1:{BACKEND_PORT}"  # 请根据你实际运行的端口修改
     ENDPOINT = "/rate_range"
     
     # 2. 构造符合 RateRangeConfig 的请求体

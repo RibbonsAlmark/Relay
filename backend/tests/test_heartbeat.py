@@ -1,8 +1,12 @@
 import requests
 import time
 import sys
+from app.config import BACKEND_PORT
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BASE_URL = "http://127.0.0.1:8000" # 根据实际端口修改
+BASE_URL = f"http://127.0.0.1:{BACKEND_PORT}" # 根据实际端口修改
 
 def test_session_lifecycle():
     # 1. 创建 Session

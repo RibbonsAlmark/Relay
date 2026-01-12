@@ -1,7 +1,11 @@
 import requests
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
 def test_source_api():
-    url = "http://127.0.0.1:8000/quick_rate_source"
+    url = f"http://127.0.0.1:{BACKEND_PORT}/quick_rate_source"
     payload = {
         "db": "db_dev",
         "col": "2026-01-04-test",

@@ -1,9 +1,13 @@
 # tests/test_batch_rate.py
 import requests
 import json
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
 def test_rate_collection():
-    url = "http://127.0.0.1:8000/rate_collection"  # 根据你的实际地址修改
+    url = f"http://127.0.0.1:{BACKEND_PORT}/rate_collection"  # 根据你的实际地址修改
     
     payload = {
         "src_database": "db_dev",

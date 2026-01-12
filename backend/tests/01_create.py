@@ -1,6 +1,10 @@
 import requests
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
-url = "http://127.0.0.1:8000/create_source"
+url = f"http://127.0.0.1:{BACKEND_PORT}/create_source"
 
 # 现在的参数是 dataset 和 collection
 payload = {

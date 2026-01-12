@@ -6,6 +6,7 @@ from datetime import datetime
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.rerun_ui_utils import RerunInterfaceHelper
+from app.config import BACKEND_PORT
 
 def test_generate_markdown():
     # 1. 模拟一个真实的 doc 数据
@@ -193,11 +194,11 @@ def test_generate_markdown():
     }
 
     # 2. 调用 Helper 生成 Markdown
-    # 模拟环境：backend_host="127.0.0.1:8000", db="test_db", col="test_col"
+    # 模拟环境：backend_host=f"127.0.0.1:{BACKEND_PORT}", db="test_db", col="test_col"
     markdown_content = RerunInterfaceHelper.generate_frame_panel(
         doc=mock_doc,
         frame_idx=1024,
-        backend_host="127.0.0.1:8000",
+        backend_host=f"127.0.0.1:{BACKEND_PORT}",
         src_db="prod_database",
         src_col="lidar_pointcloud_v1"
     )

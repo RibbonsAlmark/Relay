@@ -1,7 +1,11 @@
 import requests
 import time
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 APP_ID = "test_user_01"
 
 def test_workflow():

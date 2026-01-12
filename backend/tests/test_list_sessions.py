@@ -1,6 +1,10 @@
 import requests
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
-url = "http://127.0.0.1:8000/list_sessions"
+url = f"http://127.0.0.1:{BACKEND_PORT}/list_sessions"
 
 try:
     response = requests.get(url)

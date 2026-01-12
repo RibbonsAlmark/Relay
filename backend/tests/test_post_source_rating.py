@@ -1,8 +1,12 @@
 import requests
 import json
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
 def test_post_source_rating():
-    url = "http://127.0.0.1:8000/rate_source"
+    url = f"http://127.0.0.1:{BACKEND_PORT}/rate_source"
     
     # 根据报错信息，后端需要的字段名是：
     # src_database, src_collection, dst_database, dst_collection, source_name, score

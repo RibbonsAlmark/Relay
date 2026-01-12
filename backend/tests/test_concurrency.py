@@ -1,8 +1,12 @@
 import asyncio
 import httpx
 import time
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 CONCURRENT_COUNT = 10  # 同时开启 10 个实例
 
 async def run_client_task(client, user_id):

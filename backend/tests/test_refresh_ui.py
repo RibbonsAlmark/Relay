@@ -2,8 +2,12 @@ import requests
 import sys
 import json
 from loguru import logger
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.config import BACKEND_PORT
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = f"http://localhost:{BACKEND_PORT}"
 
 def manual_ui_refresh():
     # 1. 检查命令行参数或提示输入
