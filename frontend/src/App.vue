@@ -223,89 +223,89 @@ onMounted(async () => {
   }
 });
 
-// const waitForRerunReady = () => {
-//   return new Promise((resolve) => {
-//     const checkInterval = setInterval(() => {
-//       // 获取所有已加载的资源
-//       const resources = performance.getEntriesByType('resource');
-      
-//       // 寻找 rerun 的核心 Wasm 文件
-//       const wasmResource = resources.find(r => 
-//         r.name.includes('wasm') || r.name.includes('rerun_viewer')
-//       );
-
-//       if (wasmResource) {
-//         // 只要这个资源出现了，说明下载阶段已完成
-//         console.log(`✅ 检测到 Rerun 核心束下载完成: ${wasmResource.name}`);
-//         console.log(`耗时: ${(wasmResource.duration / 1000).toFixed(2)}s`);
-        
-//         clearInterval(checkInterval);
-        
-//         // 下载完后给 1.5s 的“解压与启动”缓冲时间，然后返回
-//         // setTimeout(resolve, 1500); 
-//       }
-//     }, 500); // 每 500ms 检查一次
-    
-//     // 设置一个 30 秒的极长超时，防止死循环
-//     setTimeout(() => {
-//       clearInterval(checkInterval);
-//       resolve();
-//     }, 30000);
-//   });
-// };
-
-// 使用canvas渲染确认rerun加载完成 
 const waitForRerunReady = () => {
   return new Promise((resolve) => {
-    const startTime = Date.now();
-    
-    const check = () => {
-      const iframe = document.querySelector('iframe');
+    const checkInterval = setInterval(() => {
+      // 获取所有已加载的资源
+      const resources = performance.getEntriesByType('resource');
       
-      // 1. 如果连 iframe 都还没挂载到 DOM，继续等
-      if (!iframe) {
-        requestAnimationFrame(check);
-        return;
-      }
+      // 寻找 rerun 的核心 Wasm 文件
+      const wasmResource = resources.find(r => 
+        r.name.includes('wasm') || r.name.includes('rerun_viewer')
+      );
 
-      try {
-        // 2. 尝试获取 Canvas (同域模式)
-        const canvas = iframe.contentDocument?.querySelector('canvas') || 
-                       iframe.contentWindow?.document.querySelector('canvas');
+      if (wasmResource) {
+        // 只要这个资源出现了，说明下载阶段已完成
+        console.log(`✅ 检测到 Rerun 核心束下载完成: ${wasmResource.name}`);
+        console.log(`耗时: ${(wasmResource.duration / 1000).toFixed(2)}s`);
         
-        if (canvas && canvas.width > 0) {
-          console.log(`✅ [Canvas模式] Rerun 引擎已就绪, 耗时: ${((Date.now() - startTime)/1000).toFixed(2)}s`);
-          resolve();
-          return;
-        }
-      } catch (e) {
-        // 3. 跨域安全错误：无法访问 contentDocument
-        // 此时回退到资源监控模式 (性能 API 跨域也能看)
-        const resources = performance.getEntriesByType('resource');
-        const wasmLoaded = resources.some(r => r.name.includes('wasm'));
+        clearInterval(checkInterval);
         
-        if (wasmLoaded) {
-          // 既然 Wasm 下载完了但我们进不去 Iframe 看 Canvas
-          // 给一个极短的固定延迟（比如 300ms）确保编译完成，然后启动
-          console.warn("⚠️ [跨域模式] 无法直接探测 Canvas，通过资源状态启动");
-          setTimeout(resolve, 300); 
-          return;
-        }
+        // 下载完后给 1.5s 的“解压与启动”缓冲时间，然后返回
+        // setTimeout(resolve, 1500); 
       }
-
-      // 4. 超时处理 (20秒)
-      if (Date.now() - startTime > 20000) {
-        console.error("❌ Rerun 加载超时，强行启动流...");
-        resolve();
-        return;
-      }
-
-      requestAnimationFrame(check);
-    };
-
-    check();
+    }, 500); // 每 500ms 检查一次
+    
+    // 设置一个 30 秒的极长超时，防止死循环
+    setTimeout(() => {
+      clearInterval(checkInterval);
+      resolve();
+    }, 30000);
   });
 };
+
+// 使用canvas渲染确认rerun加载完成 
+// const waitForRerunReady = () => {
+//   return new Promise((resolve) => {
+//     const startTime = Date.now();
+    
+//     const check = () => {
+//       const iframe = document.querySelector('iframe');
+      
+//       // 1. 如果连 iframe 都还没挂载到 DOM，继续等
+//       if (!iframe) {
+//         requestAnimationFrame(check);
+//         return;
+//       }
+
+//       try {
+//         // 2. 尝试获取 Canvas (同域模式)
+//         const canvas = iframe.contentDocument?.querySelector('canvas') || 
+//                        iframe.contentWindow?.document.querySelector('canvas');
+        
+//         if (canvas && canvas.width > 0) {
+//           console.log(`✅ [Canvas模式] Rerun 引擎已就绪, 耗时: ${((Date.now() - startTime)/1000).toFixed(2)}s`);
+//           resolve();
+//           return;
+//         }
+//       } catch (e) {
+//         // 3. 跨域安全错误：无法访问 contentDocument
+//         // 此时回退到资源监控模式 (性能 API 跨域也能看)
+//         const resources = performance.getEntriesByType('resource');
+//         const wasmLoaded = resources.some(r => r.name.includes('wasm'));
+        
+//         if (wasmLoaded) {
+//           // 既然 Wasm 下载完了但我们进不去 Iframe 看 Canvas
+//           // 给一个极短的固定延迟（比如 300ms）确保编译完成，然后启动
+//           console.warn("⚠️ [跨域模式] 无法直接探测 Canvas，通过资源状态启动");
+//           setTimeout(resolve, 300); 
+//           return;
+//         }
+//       }
+
+//       // 4. 超时处理 (20秒)
+//       if (Date.now() - startTime > 20000) {
+//         console.error("❌ Rerun 加载超时，强行启动流...");
+//         resolve();
+//         return;
+//       }
+
+//       requestAnimationFrame(check);
+//     };
+
+//     check();
+//   });
+// };
 
 const handleCreateSource = async () => {
   loading.value = true;
