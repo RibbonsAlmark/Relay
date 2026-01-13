@@ -66,8 +66,9 @@ class RerunInterfaceHelper:
         source_name = doc.get("info", {}).get("source")
         current_rating = TaggerLogic.get_current_rating(doc.get("tag"))
         rating_display = f"## `{current_rating}`" if current_rating != "Unrated" else "*Unrated*"
-        url = f"http://{host}/quick_rate_collection"
-        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        url = f"http://{host}/quick_rate_source"
+        safe_source = quote(str(source_name))
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&source={safe_source}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         rating_btn = " &nbsp; | &nbsp; ".join(links)
         return (
             "## Data Quality\n\n"
