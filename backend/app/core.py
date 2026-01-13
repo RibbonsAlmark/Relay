@@ -170,7 +170,9 @@ class RerunSession:
             # 只提取顺序数据 (Pose, Axes 等)
             payload = RerunLogger.compute_sequential_payload(
                 frame_data, idx, 
-                src_db=self.dataset, src_col=self.collection
+                src_db=self.dataset, 
+                src_col=self.collection,
+                recording_uuid=self.recording_uuid
             )
             if payload:
                 with self.log_lock:
@@ -187,7 +189,9 @@ class RerunSession:
             # 只提取异步数据 (Image 等)
             payload = RerunLogger.compute_async_payload(
                 frame_data, idx, 
-                src_db=self.dataset, src_col=self.collection
+                src_db=self.dataset, 
+                src_col=self.collection,
+                recording_uuid=self.recording_uuid
             )
             if payload:
                 # 计算完后塞进队列，由 sender_loop 补发图像
@@ -270,7 +274,7 @@ class RerunSession:
             with self.play_lock:
                 self.is_playing = False
 
-    def _execute_recompute_pipeline(self, processor_classes: list, label: str):
+    def _execute_recompute_pipeline(self, target_processors: list, label: str):
         if self.is_dead: return
         
         logger.info(f"[{self.recording_uuid}] 启动异步重计算: {label}")
@@ -285,10 +289,10 @@ class RerunSession:
             if self.is_dead or self.stop_signal.is_set(): return
             try:
                 # 【关键修复】确保显式传入 frame_idx 参数
-                payload = RerunLogger.compute_frame_payload(
+                payload = RerunLogger.compute_async_payload(
                     doc=frame_data,        # 对应 doc
                     frame_idx=idx,         # 对应 frame_idx (之前可能写成了 idx 或者漏传了)
-                    processor_classes=processor_classes,
+                    target_processors=target_processors,
                     src_db=self.dataset, 
                     src_col=self.collection,
                     recording_uuid=self.recording_uuid

@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Type, Optional
 from loguru import logger
 
 # 导入具体的处理器类
+from .processors.base import BaseProcessor
 from .processors.ui_processor import UIProcessor
 from .processors.image_processor import ImageProcessor
 from .processors.joint_processor import JointProcessor
@@ -20,20 +21,33 @@ class RerunLogger:
     ]
     
     @classmethod
-    def compute_sequential_payload(cls, doc: Dict[str, Any], frame_idx: int, **kwargs) -> Dict[str, Any]:
+    def compute_sequential_payload(
+        cls, doc: Dict[str, Any], frame_idx: int,
+        target_processors: Optional[List[BaseProcessor]] = None, **kwargs
+    ) -> Dict[str, Any]:
         """专门提取需要顺序发送的强时序数据 (is_sequential=True)"""
-        return cls._compute_by_filter(doc, frame_idx, True, **kwargs)
+        return cls._compute_by_filter(doc, frame_idx, True, target_processors, **kwargs)
 
     @classmethod
-    def compute_async_payload(cls, doc: Dict[str, Any], frame_idx: int, **kwargs) -> Dict[str, Any]:
+    def compute_async_payload(
+        cls, doc: Dict[str, Any], frame_idx: int, 
+        target_processors: Optional[List[BaseProcessor]] = None, **kwargs
+    ) -> Dict[str, Any]:
         """专门提取可以异步并行处理的数据 (is_sequential=False)"""
-        return cls._compute_by_filter(doc, frame_idx, False, **kwargs)
+        return cls._compute_by_filter(doc, frame_idx, False, target_processors, **kwargs)
 
     @classmethod
-    def _compute_by_filter(cls, doc: Dict[str, Any], frame_idx: int, target_is_seq: bool, **kwargs) -> Dict[str, Any]:
+    def _compute_by_filter(
+        cls, doc: Dict[str, Any], frame_idx: int, target_is_seq: bool, 
+        target_processors: Optional[List[BaseProcessor]] = None, **kwargs
+    ) -> Dict[str, Any]:
         """内部通用过滤计算函数"""
         payload = {}
-        for proc_cls in cls.DEFAULT_PROCESSOR_CLASSES:
+
+        if target_processors is None:
+            target_processors = cls.DEFAULT_PROCESSOR_CLASSES
+            
+        for proc_cls in target_processors:
             # 过滤逻辑
             is_seq = getattr(proc_cls, 'is_sequential', False)
             if is_seq != target_is_seq:
