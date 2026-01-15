@@ -9,6 +9,7 @@ from .processors.image_processor import ImageProcessor
 from .processors.joint_processor import JointProcessor
 from .processors.pose_processor import PoseProcessor
 from .processors.lidar_processor import LidarProcessor
+from .processors.meta_processor import MetaProcessor
 
 class RerunLogger:
     # 存储类引用，而不是实例对象
@@ -17,7 +18,8 @@ class RerunLogger:
         ImageProcessor,
         JointProcessor,
         PoseProcessor,
-        LidarProcessor
+        LidarProcessor,
+        MetaProcessor,
     ]
     
     @classmethod

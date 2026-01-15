@@ -5,6 +5,7 @@ import threading
 import socket
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from app.metadata_utils import get_global_sources
 import concurrent.futures
 from typing import Dict, Set
 from loguru import logger
@@ -84,6 +85,12 @@ class RerunSession:
 
         # 线程锁
         self.log_lock = threading.Lock()
+
+        self.source_catalog = get_global_sources(
+            dataset=dataset,
+            collection=collection,
+            start_index=0
+        )
         
         logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
 
@@ -136,7 +143,8 @@ class RerunSession:
                 payload = RerunLogger.compute_frame_payload(
                     frame_data, idx, 
                     src_db=self.dataset, src_col=self.collection,
-                    recording_uuid=self.recording_uuid
+                    recording_uuid=self.recording_uuid,
+                    source_catalog=self.source_catalog,
                 )
                 # 阻塞入队：实现背压的核心
                 # 如果 log_queue 满了，工作线程会在此等待，间接拖慢 process_executor
@@ -172,7 +180,9 @@ class RerunSession:
                 frame_data, idx, 
                 src_db=self.dataset, 
                 src_col=self.collection,
-                recording_uuid=self.recording_uuid
+                recording_uuid=self.recording_uuid,
+                source_catalog=self.source_catalog,
+
             )
             if payload:
                 with self.log_lock:
@@ -191,7 +201,8 @@ class RerunSession:
                 frame_data, idx, 
                 src_db=self.dataset, 
                 src_col=self.collection,
-                recording_uuid=self.recording_uuid
+                recording_uuid=self.recording_uuid,
+                source_catalog=self.source_catalog,
             )
             if payload:
                 # 计算完后塞进队列，由 sender_loop 补发图像
@@ -295,7 +306,8 @@ class RerunSession:
                     target_processors=target_processors,
                     src_db=self.dataset, 
                     src_col=self.collection,
-                    recording_uuid=self.recording_uuid
+                    recording_uuid=self.recording_uuid,
+                    source_catalog=self.source_catalog,
                 )
                 
                 # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
