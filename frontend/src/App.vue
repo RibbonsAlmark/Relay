@@ -225,33 +225,47 @@ onMounted(async () => {
 
 const waitForRerunReady = () => {
   return new Promise((resolve) => {
-    const checkInterval = setInterval(() => {
-      // 获取所有已加载的资源
-      const resources = performance.getEntriesByType('resource');
-      
-      // 寻找 rerun 的核心 Wasm 文件
-      const wasmResource = resources.find(r => 
-        r.name.includes('wasm') || r.name.includes('rerun_viewer')
-      );
-
-      if (wasmResource) {
-        // 只要这个资源出现了，说明下载阶段已完成
-        console.log(`✅ 检测到 Rerun 核心束下载完成: ${wasmResource.name}`);
-        console.log(`耗时: ${(wasmResource.duration / 1000).toFixed(2)}s`);
-        
-        clearInterval(checkInterval);
-        
-        // 下载完后给 1.5s 的“解压与启动”缓冲时间，然后返回
-        // setTimeout(resolve, 1500); 
-      }
-    }, 500); // 每 500ms 检查一次
-    
-    // 设置一个 30 秒的极长超时，防止死循环
-    setTimeout(() => {
-      clearInterval(checkInterval);
-      resolve();
-    }, 30000);
+    window.addEventListener("message", (event) => { 
+        // 安全起见，建议检查 event.origin 
+        if (event.data && event.data.type === "rerun_ready") { 
+            console.log("Rerun viewer 已准备好接收数据！"); 
+            resolve();
+            
+            // 在这里可以开始向 iframe 发送数据了 
+            // const iframe = document.getElementById("my-rerun-iframe"); 
+            // iframe.contentWindow.postMessage({ ... }, "*"); 
+        } 
+    }); 
   });
+  
+  // return new Promise((resolve) => {
+  //   const checkInterval = setInterval(() => {
+  //     // 获取所有已加载的资源
+  //     const resources = performance.getEntriesByType('resource');
+  //     
+  //     // 寻找 rerun 的核心 Wasm 文件
+  //     const wasmResource = resources.find(r => 
+  //       r.name.includes('wasm') || r.name.includes('rerun_viewer')
+  //     );
+  //
+  //     if (wasmResource) {
+  //       // 只要这个资源出现了，说明下载阶段已完成
+  //       console.log(`✅ 检测到 Rerun 核心束下载完成: ${wasmResource.name}`);
+  //       console.log(`耗时: ${(wasmResource.duration / 1000).toFixed(2)}s`);
+  //       
+  //       clearInterval(checkInterval);
+  //       
+  //       // 下载完后给 1.5s 的“解压与启动”缓冲时间，然后返回
+  //       // setTimeout(resolve, 1500); 
+  //     }
+  //   }, 500); // 每 500ms 检查一次
+  //   
+  //   // 设置一个 30 秒的极长超时，防止死循环
+  //   setTimeout(() => {
+  //     clearInterval(checkInterval);
+  //     resolve();
+  //   }, 30000);
+  // });
 };
 
 // 使用canvas渲染确认rerun加载完成 
