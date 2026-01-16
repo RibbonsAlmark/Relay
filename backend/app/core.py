@@ -38,8 +38,6 @@ class PortManager:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('localhost', port)) != 0
 
-import heapq
-
 class RerunSession:
     def __init__(self, dataset: str, collection: str, port_manager: PortManager):
         self.dataset = dataset
@@ -76,8 +74,9 @@ class RerunSession:
             make_default=False
         )
 
-        # 1. 顺序任务执行器：已废弃，改用 process_executor + seq_buffer 实现并发计算顺序提交
-        # self.seq_executor = ThreadPoolExecutor(max_workers=1)
+        # 1. 顺序任务执行器：只有一个 worker，保证任务“先入先出”
+        # 所有的 PoseProcessor 任务都提交到这里，它们会排队，绝不超车
+        self.seq_executor = ThreadPoolExecutor(max_workers=1)
         
         # 2. 并发执行器：处理耗时任务（图像、点云等）
         self.process_executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
@@ -189,10 +188,9 @@ class RerunSession:
             for i, frame_data in enumerate(frames):
                 idx = base_idx + i
                 
-                # --- 分支 A: 顺序支流 (改为并发计算 + 顺序重组) ---
-                # 不再使用单线程池，而是混入 process_executor 并发计算
-                # 这样可以利用多核加速 Pose 计算，同时通过 Buffer 逻辑保证入队顺序
-                self.process_executor.submit(self._seq_task_handler, frame_data, idx)
+                # --- 分支 A: 顺序支流 ---
+                # 仅仅是提交任务，瞬间完成，不阻塞读取
+                self.seq_executor.submit(self._seq_task_handler, frame_data, idx)
 
                 # --- 分支 B: 异步支流 ---
                 # 依然由多线程池全速计算图像
@@ -204,45 +202,23 @@ class RerunSession:
             return False
 
     def _seq_task_handler(self, frame_data, idx):
-        """
-        顺序任务处理器 (并发版)：
-        虽然在多线程池中运行，但通过 seq_buffer 保证最终入队顺序。
-        这实现了"见缝插针"式计算（分散在多线程中），但"井然有序"地提交。
-        """
+        """这个函数由于在 max_workers=1 的线程池运行，天然具备顺序性"""
         if self.is_dead or self.stop_signal.is_set(): return
-        
         try:
-            # 1. 并发计算 (耗时操作，不持有锁)
+            # 只提取顺序数据 (Pose, Axes 等)
             prio, payload = RerunLogger.compute_sequential_payload(
                 frame_data, idx, 
                 src_db=self.dataset, 
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
                 source_catalog=self.source_catalog,
+
             )
-            
-            # 2. 顺序提交逻辑 (持有锁，快速操作)
-            with self.seq_lock:
-                # 即使 payload 为空，也要参与排序，否则会阻塞后续帧
-                # 将结果存入缓冲区
-                heapq.heappush(self.seq_buffer, (idx, prio, payload))
-                
-                # 尝试连续提交缓冲区中已就绪的帧
-                while self.seq_buffer and self.seq_buffer[0][0] == self.next_seq_idx:
-                    _, p, content = heapq.heappop(self.seq_buffer)
-                    
-                    if content:
-                        # 只有非空内容才入队发送
-                        self.log_queue.put((p, self.next_seq_idx, content), block=True)
-                    
-                    self.next_seq_idx += 1
-                    
+            if payload:
+                # 使用动态优先级
+                self.log_queue.put((prio, idx, payload), block=True)
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
-            # 出错时也要推进序号，避免死锁
-            with self.seq_lock:
-                 if idx == self.next_seq_idx:
-                     self.next_seq_idx += 1
 
     def _async_task_handler(self, frame_data, idx):
         """在多线程池运行，处理图像等耗时项"""
