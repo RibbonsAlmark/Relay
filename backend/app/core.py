@@ -188,7 +188,7 @@ class RerunSession:
                 with self.log_lock:
                     self.stream.set_time("frame_idx", sequence=idx)
                     for path, comp in payload.items():
-                        self.stream.log(path, *(comp if isinstance(comp, list) else [comp]))
+                        self.stream_log(path, *(comp if isinstance(comp, list) else [comp]))
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
 
@@ -239,9 +239,9 @@ class RerunSession:
                                 self.stream.set_time("frame_idx", sequence=idx)
                                 for path, component in payload.items():
                                     if isinstance(component, list):
-                                        self.stream.log(path, *component)
+                                        self.stream_log(path, *component)
                                     else:
-                                        self.stream.log(path, component)
+                                        self.stream_log(path, component)
                             self.log_queue.task_done()
                         except queue.Empty:
                             continue
@@ -319,6 +319,11 @@ class RerunSession:
         for i, doc in enumerate(frames_iter):
             if self.stop_signal.is_set(): break
             self.process_executor.submit(_task, doc, i)
+
+    def stream_log(self, path, component, static=False):
+            # if path == "meta/source_catalog":
+            #     static = True
+            self.stream.log(path, component, static=static)
     
     def cleanup(self):
         if self.is_dead: 

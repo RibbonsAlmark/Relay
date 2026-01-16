@@ -21,4 +21,4 @@ class MetaProcessor(BaseProcessor):
         if source_catalog is not None:
             catalog_json = json.dumps(source_catalog, ensure_ascii=False)
             # 记录到专有的元数据路径
-            yield "meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/plain"),
+            yield "meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"),
