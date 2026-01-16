@@ -1,10 +1,12 @@
 import rerun as rr
 from typing import Dict, Any, Generator, Tuple, List
 from .base import BaseProcessor
+from app.priority_config import PriorityConfig
 
 class PoseProcessor(BaseProcessor):
     # 【核心标识】标记该 Processor 必须在主流中按顺序同步处理
     is_sequential = True
+    priority = PriorityConfig.POSE
     
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         # --- 1. 处理 pose_estimation (支持字典和列表) ---

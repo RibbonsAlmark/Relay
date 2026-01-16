@@ -38,6 +38,8 @@ class PortManager:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('localhost', port)) != 0
 
+import heapq
+
 class RerunSession:
     def __init__(self, dataset: str, collection: str, port_manager: PortManager):
         self.dataset = dataset
@@ -59,7 +61,9 @@ class RerunSession:
         self.stop_signal = threading.Event() 
         
         # --- 【背压控制】 ---
-        self.log_queue = queue.Queue(maxsize=32)
+        # 使用 PriorityQueue 实现优先级控制
+        # 优先级定义：0 (高，Pose/Seq) < 10 (低，Image/Async)
+        self.log_queue = queue.PriorityQueue(maxsize=32)
         self.max_frame_idx = 0 
         
         self.created_at = time.time()
@@ -72,9 +76,8 @@ class RerunSession:
             make_default=False
         )
 
-        # 1. 顺序任务执行器：只有一个 worker，保证任务“先入先出”
-        # 所有的 PoseProcessor 任务都提交到这里，它们会排队，绝不超车
-        self.seq_executor = ThreadPoolExecutor(max_workers=1)
+        # 1. 顺序任务执行器：已废弃，改用 process_executor + seq_buffer 实现并发计算顺序提交
+        # self.seq_executor = ThreadPoolExecutor(max_workers=1)
         
         # 2. 并发执行器：处理耗时任务（图像、点云等）
         self.process_executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
@@ -86,13 +89,41 @@ class RerunSession:
         # 线程锁
         self.log_lock = threading.Lock()
 
-        self.source_catalog = get_global_sources(
-            dataset=dataset,
-            collection=collection,
-            start_index=0
-        )
+        # 1. Source Catalog 独立线程初始化
+        self._source_catalog_cache = []
+        self._source_catalog_event = threading.Event()
+        
+        def _init_source_catalog():
+            try:
+                result = get_global_sources(
+                    dataset=dataset,
+                    collection=collection,
+                    start_index=0,
+                    max_workers=8
+                )
+                self._source_catalog_cache = result
+            except Exception as e:
+                logger.error(f"[{self.recording_uuid}] Source Catalog Init Failed: {e}")
+            finally:
+                self._source_catalog_event.set()
+
+        # 启动守护线程，不阻塞主线程，且随主线程退出自动销毁
+        threading.Thread(target=_init_source_catalog, daemon=True).start()
+
+        # 2. 顺序任务重组缓冲区 (Reordering Buffer)
+        # 不再使用单线程池，而是通过缓冲区实现并发计算 + 顺序提交
+        self.next_seq_idx = 0
+        self.seq_buffer = []  # Heapq: (idx, prio, payload)
+        self.seq_lock = threading.Lock()
         
         logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
+
+    @property
+    def source_catalog(self):
+        """懒加载获取 source_catalog，如果未完成则阻塞等待"""
+        # 等待初始化线程完成
+        self._source_catalog_event.wait()
+        return self._source_catalog_cache
 
     def heartbeat(self):
         """外部调用此方法续命"""
@@ -147,8 +178,8 @@ class RerunSession:
                     source_catalog=self.source_catalog,
                 )
                 # 阻塞入队：实现背压的核心
-                # 如果 log_queue 满了，工作线程会在此等待，间接拖慢 process_executor
-                self.log_queue.put((idx, payload), block=True)
+                # 优先级 10 (低)
+                self.log_queue.put((10, idx, payload), block=True)
             except Exception as e:
                 logger.error(f"Async Task Error at frame {idx}: {e}")
 
@@ -158,9 +189,10 @@ class RerunSession:
             for i, frame_data in enumerate(frames):
                 idx = base_idx + i
                 
-                # --- 分支 A: 顺序支流 ---
-                # 仅仅是提交任务，瞬间完成，不阻塞读取
-                self.seq_executor.submit(self._seq_task_handler, frame_data, idx)
+                # --- 分支 A: 顺序支流 (改为并发计算 + 顺序重组) ---
+                # 不再使用单线程池，而是混入 process_executor 并发计算
+                # 这样可以利用多核加速 Pose 计算，同时通过 Buffer 逻辑保证入队顺序
+                self.process_executor.submit(self._seq_task_handler, frame_data, idx)
 
                 # --- 分支 B: 异步支流 ---
                 # 依然由多线程池全速计算图像
@@ -172,32 +204,52 @@ class RerunSession:
             return False
 
     def _seq_task_handler(self, frame_data, idx):
-        """这个函数由于在 max_workers=1 的线程池运行，天然具备顺序性"""
+        """
+        顺序任务处理器 (并发版)：
+        虽然在多线程池中运行，但通过 seq_buffer 保证最终入队顺序。
+        这实现了"见缝插针"式计算（分散在多线程中），但"井然有序"地提交。
+        """
         if self.is_dead or self.stop_signal.is_set(): return
+        
         try:
-            # 只提取顺序数据 (Pose, Axes 等)
-            payload = RerunLogger.compute_sequential_payload(
+            # 1. 并发计算 (耗时操作，不持有锁)
+            prio, payload = RerunLogger.compute_sequential_payload(
                 frame_data, idx, 
                 src_db=self.dataset, 
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
                 source_catalog=self.source_catalog,
-
             )
-            if payload:
-                with self.log_lock:
-                    self.stream.set_time("frame_idx", sequence=idx)
-                    for path, comp in payload.items():
-                        self.stream_log(path, *(comp if isinstance(comp, list) else [comp]))
+            
+            # 2. 顺序提交逻辑 (持有锁，快速操作)
+            with self.seq_lock:
+                # 即使 payload 为空，也要参与排序，否则会阻塞后续帧
+                # 将结果存入缓冲区
+                heapq.heappush(self.seq_buffer, (idx, prio, payload))
+                
+                # 尝试连续提交缓冲区中已就绪的帧
+                while self.seq_buffer and self.seq_buffer[0][0] == self.next_seq_idx:
+                    _, p, content = heapq.heappop(self.seq_buffer)
+                    
+                    if content:
+                        # 只有非空内容才入队发送
+                        self.log_queue.put((p, self.next_seq_idx, content), block=True)
+                    
+                    self.next_seq_idx += 1
+                    
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
+            # 出错时也要推进序号，避免死锁
+            with self.seq_lock:
+                 if idx == self.next_seq_idx:
+                     self.next_seq_idx += 1
 
     def _async_task_handler(self, frame_data, idx):
         """在多线程池运行，处理图像等耗时项"""
         if self.is_dead or self.stop_signal.is_set(): return
         try:
             # 只提取异步数据 (Image 等)
-            payload = RerunLogger.compute_async_payload(
+            prio, payload = RerunLogger.compute_async_payload(
                 frame_data, idx, 
                 src_db=self.dataset, 
                 src_col=self.collection,
@@ -206,7 +258,8 @@ class RerunSession:
             )
             if payload:
                 # 计算完后塞进队列，由 sender_loop 补发图像
-                self.log_queue.put((idx, payload), block=True)
+                # 使用动态优先级
+                self.log_queue.put((prio, idx, payload), block=True)
         except Exception as e:
             logger.error(f"Async Task Error at frame {idx}: {e}")
     
@@ -234,15 +287,20 @@ class RerunSession:
                     while not self.stop_signal.is_set() or not self.log_queue.empty():
                         try:
                             item = self.log_queue.get(timeout=0.5)
-                            idx, payload = item
-                            with self.log_lock:
-                                self.stream.set_time("frame_idx", sequence=idx)
-                                for path, component in payload.items():
-                                    if isinstance(component, list):
-                                        self.stream_log(path, *component)
-                                    else:
-                                        self.stream_log(path, component)
-                            self.log_queue.task_done()
+                            # 解包：priority, idx, payload
+                            _, idx, payload = item
+                            try:
+                                with self.log_lock:
+                                    self.stream.set_time("frame_idx", sequence=idx)
+                                    for path, component in payload.items():
+                                        if isinstance(component, list):
+                                            self.stream.log(path, *component)
+                                        else:
+                                            self.stream.log(path, component)
+                            except Exception as e:
+                                logger.error(f"[{self.recording_uuid}] Sender Loop Write Error: {e}")
+                            finally:
+                                self.log_queue.task_done()
                         except queue.Empty:
                             continue
                 finally:
@@ -300,7 +358,7 @@ class RerunSession:
             if self.is_dead or self.stop_signal.is_set(): return
             try:
                 # 【关键修复】确保显式传入 frame_idx 参数
-                payload = RerunLogger.compute_async_payload(
+                prio, payload = RerunLogger.compute_async_payload(
                     doc=frame_data,        # 对应 doc
                     frame_idx=idx,         # 对应 frame_idx (之前可能写成了 idx 或者漏传了)
                     target_processors=target_processors,
@@ -311,7 +369,8 @@ class RerunSession:
                 )
                 
                 # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
-                self.log_queue.put((idx, payload), block=True)
+                # 使用动态优先级
+                self.log_queue.put((prio, idx, payload), block=True)
                 
             except Exception as e:
                 logger.error(f"[{label}] 帧 {idx} 任务失败: {e}")
@@ -319,11 +378,6 @@ class RerunSession:
         for i, doc in enumerate(frames_iter):
             if self.stop_signal.is_set(): break
             self.process_executor.submit(_task, doc, i)
-
-    def stream_log(self, path, component, static=False):
-            # if path == "meta/source_catalog":
-            #     static = True
-            self.stream.log(path, component, static=static)
     
     def cleanup(self):
         if self.is_dead: 

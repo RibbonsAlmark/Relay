@@ -1,5 +1,6 @@
 from typing import Dict, Any, Generator, Tuple, Union, List
 import rerun as rr
+from app.priority_config import PriorityConfig
 
 class BaseProcessor:
     """
@@ -11,6 +12,10 @@ class BaseProcessor:
     # False (默认): 允许进入线程池异步并行处理。
     # True: 必须在主流中按顺序同步处理，保障时序严格一致。
     is_sequential: bool = False
+    
+    # 任务优先级：0 (高) ~ 10 (低)
+    # 默认使用配置中的 DEFAULT 值
+    priority: int = PriorityConfig.DEFAULT
 
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Union[rr.AsComponents, List[rr.AsComponents]]], None, None]:
         """

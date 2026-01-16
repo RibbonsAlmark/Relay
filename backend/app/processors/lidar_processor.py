@@ -4,10 +4,12 @@ import numpy as np
 import open3d as o3d
 from typing import Dict, Any, Generator, Tuple
 from .base import BaseProcessor
+from app.priority_config import PriorityConfig
 
 class LidarProcessor(BaseProcessor):
     # 开启强顺序模式，解决位姿抖动
     is_sequential = False
+    priority = PriorityConfig.LIDAR
 
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         """

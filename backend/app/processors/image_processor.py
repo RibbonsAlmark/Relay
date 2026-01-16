@@ -5,8 +5,12 @@ from PIL import Image
 import io
 from typing import Dict, Any, List, Generator, Tuple
 from .base import BaseProcessor
+from app.priority_config import PriorityConfig
 
 class ImageProcessor(BaseProcessor):
+    is_sequential: bool = False
+    priority = PriorityConfig.IMAGE
+
     def process(self, doc: Dict[str, Any], **kwargs) -> Generator[Tuple[str, Any], None, None]:
         for cam in doc.get('camera', []):
             cam_name = cam.get('name', 'camera')
