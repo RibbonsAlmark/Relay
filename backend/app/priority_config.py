@@ -15,6 +15,9 @@ class PriorityConfig:
     # 耗时传感器数据 (Async)
     LIDAR = 4
     IMAGE = 3
+
+    # 评分UI
+    UI = 0
     
     # 默认兜底
     DEFAULT = 10

@@ -1,5 +1,5 @@
 import datetime
-from typing import Any, Dict, Generator, List
+from typing import Any, Dict, Generator
 from dp_data_common.client.data_client import DataClient
 from loguru import logger
 from .logic.tagger import TaggerLogic
@@ -74,7 +74,7 @@ class DataManager:
             for doc in cursor:
                 yield DataManager._clean_doc(doc)
         except Exception as e:
-            print(actual_host)(f"Database Error: {e}")
+            print(f"Database Error: {e}")
 
     @staticmethod
     def _clean_doc(doc: Any) -> Any:

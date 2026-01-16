@@ -62,6 +62,8 @@ class RerunSession:
         # 使用 PriorityQueue 实现优先级控制
         # 优先级定义：0 (高，Pose/Seq) < 10 (低，Image/Async)
         self.log_queue = queue.PriorityQueue(maxsize=32)
+        self.log_queue_counter = 0  # 用于解决 PriorityQueue 优先级相同时的排序冲突
+        self.queue_lock = threading.Lock() # 保护 counter 的线程安全
         self.max_frame_idx = 0 
         
         self.created_at = time.time()
@@ -124,6 +126,15 @@ class RerunSession:
         self._source_catalog_event.wait()
         return self._source_catalog_cache
 
+    def _enqueue_payload(self, priority, idx, payload):
+        """统一入队封装，解决 dict 不可比较导致的 crash"""
+        with self.queue_lock:
+            count = self.log_queue_counter
+            self.log_queue_counter += 1
+        # 结构：(priority, idx, count, payload)
+        # 只要 priority 和 idx 相同，count 必定不同，永远不会比较 payload
+        self.log_queue.put((priority, idx, count, payload), block=True)
+
     def heartbeat(self):
         """外部调用此方法续命"""
         self.last_heartbeat = time.time()
@@ -178,7 +189,7 @@ class RerunSession:
                 )
                 # 阻塞入队：实现背压的核心
                 # 优先级 10 (低)
-                self.log_queue.put((10, idx, payload), block=True)
+                self._enqueue_payload(10, idx, payload)
             except Exception as e:
                 logger.error(f"Async Task Error at frame {idx}: {e}")
 
@@ -216,7 +227,7 @@ class RerunSession:
             )
             if payload:
                 # 使用动态优先级
-                self.log_queue.put((prio, idx, payload), block=True)
+                self._enqueue_payload(prio, idx, payload)
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
 
@@ -235,7 +246,7 @@ class RerunSession:
             if payload:
                 # 计算完后塞进队列，由 sender_loop 补发图像
                 # 使用动态优先级
-                self.log_queue.put((prio, idx, payload), block=True)
+                self._enqueue_payload(prio, idx, payload)
         except Exception as e:
             logger.error(f"Async Task Error at frame {idx}: {e}")
     
@@ -263,8 +274,8 @@ class RerunSession:
                     while not self.stop_signal.is_set() or not self.log_queue.empty():
                         try:
                             item = self.log_queue.get(timeout=0.5)
-                            # 解包：priority, idx, payload
-                            _, idx, payload = item
+                            # 解包：priority, idx, count, payload
+                            _, idx, _, payload = item
                             try:
                                 with self.log_lock:
                                     self.stream.set_time("frame_idx", sequence=idx)
@@ -346,7 +357,7 @@ class RerunSession:
                 
                 # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
                 # 使用动态优先级
-                self.log_queue.put((prio, idx, payload), block=True)
+                self._enqueue_payload(prio, idx, payload)
                 
             except Exception as e:
                 logger.error(f"[{label}] 帧 {idx} 任务失败: {e}")
