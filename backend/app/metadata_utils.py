@@ -22,28 +22,33 @@ def process_chunk(chunk_data: List[tuple]) -> Dict[str, int]:
                 local_results[s_id] = idx
     return local_results
 
-def get_global_sources(dataset: str, collection: str, start_index: int = 0, max_workers: int = 8) -> List[Dict[str, Any]]:
+def get_global_sources(dataset: str, collection: str, start_index: int = 0, max_workers: int = 8, existing_iter: List[Dict] = None) -> List[Dict[str, Any]]:
     """
     高效扫描数据集，提取所有数据源。
     优化点：
     1. 局部处理减少锁竞争。
     2. 字段过滤（需 DataManager 支持）。
+    3. 支持复用已有的迭代器/列表 (existing_iter)。
     """
     global_source_map = {}
     logging.info(f"开始扫描数据集 {dataset}/{collection}，并发数: {max_workers}")
 
-    # 关键优化：如果 DataManager 支持 projection，只取 'info.source' 字段
-    # 这将减少 90% 以上的网络传输和内存占用
-    # 示例假设 fetch_frames_iter 接受 projection 参数
-    try:
-        frames_iter = DataManager.fetch_frames_iter(
-            dataset, 
-            collection, 
-            projection={"info.source": 1} 
-        )
-    except TypeError:
-        # 降级处理：如果不支持字段过滤，速度会受限于文档大小
-        frames_iter = DataManager.fetch_frames_iter(dataset, collection)
+    if existing_iter is not None:
+        # 如果提供了现成的数据列表，直接使用
+        frames_iter = existing_iter
+    else:
+        # 关键优化：如果 DataManager 支持 projection，只取 'info.source' 字段
+        # 这将减少 90% 以上的网络传输和内存占用
+        # 示例假设 fetch_frames_iter 接受 projection 参数
+        try:
+            frames_iter = DataManager.fetch_frames_iter(
+                dataset, 
+                collection, 
+                projection={"info.source": 1} 
+            )
+        except TypeError:
+            # 降级处理：如果不支持字段过滤，速度会受限于文档大小
+            frames_iter = DataManager.fetch_frames_iter(dataset, collection)
 
     chunk_size = 500  # 适当增大块大小
     current_chunk = []

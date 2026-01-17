@@ -13,7 +13,7 @@ import os
 from .data_provider import DataManager
 from .rerun_logger import RerunLogger
 from .port_manager import PortManager
-from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER
+from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER, SENDER_THREAD_COUNT
 
 class RerunSession:
     def __init__(self, dataset: str, collection: str, port_manager: PortManager):
@@ -39,11 +39,13 @@ class RerunSession:
         self.max_workers = (os.cpu_count() or 4) * WORKER_THREAD_MULTIPLIER
         self.process_executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
-        # --- 【背压控制】 ---
-        # 使用 PriorityQueue 实现优先级控制
-        # 优先级定义：0 (高，Pose/Seq) < 10 (低，Image/Async)
-        # 队列大小与线程数挂钩
-        self.log_queue = queue.PriorityQueue(maxsize=self.max_workers * BACKPRESSURE_QUEUE_MULTIPLIER)
+        # --- 【背压控制 & 双队列架构】 ---
+        # 1. 顺序队列 (Sequential Queue): FIFO, 严格保序, 仅由 1 个发送线程消费
+        self.seq_queue = queue.Queue(maxsize=self.max_workers * 2)
+        
+        # 2. 异步队列 (Async Queue): PriorityQueue, 支持并发发送, 由 SENDER_THREAD_COUNT 个线程消费
+        self.async_queue = queue.PriorityQueue(maxsize=self.max_workers * BACKPRESSURE_QUEUE_MULTIPLIER)
+        
         self.log_queue_counter = 0  # 用于解决 PriorityQueue 优先级相同时的排序冲突
         self.queue_lock = threading.Lock() # 保护 counter 的线程安全
         self.max_frame_idx = 0 
@@ -74,13 +76,26 @@ class RerunSession:
         self._source_catalog_cache = []
         self._source_catalog_event = threading.Event()
         
+        # 2. Frames Iter 独立线程初始化 (Lazy Loading)
+        self._frames_iter_cache = None
+        self._frames_iter_event = threading.Event()
+
         def _init_source_catalog():
             try:
+                # 等待 frames_iter 加载完成，复用它
+                self._frames_iter_event.wait()
+                frames_iter = self._frames_iter_cache
+                
+                # 注意：get_global_sources 需要能够处理迭代器复用，或者我们这里只传部分参数
+                # 但根据用户要求，get_global_sources 不允许内部再查一次
+                # 修改 metadata_utils.get_global_sources 使其支持直接传入 frames_iter (需要修改函数签名)
+                # 这里暂时假设我们修改 get_global_sources 的实现
                 result = get_global_sources(
                     dataset=dataset,
                     collection=collection,
                     start_index=0,
-                    max_workers=8
+                    max_workers=8,
+                    existing_iter=frames_iter # 假设新增参数
                 )
                 self._source_catalog_cache = result
             except Exception as e:
@@ -88,8 +103,24 @@ class RerunSession:
             finally:
                 self._source_catalog_event.set()
 
-        # 启动守护线程，不阻塞主线程，且随主线程退出自动销毁
-        threading.Thread(target=_init_source_catalog, daemon=True).start()
+        def _init_frames_iter():
+            try:
+                # 预加载所有帧 (List[Dict]) 以便复用
+                # 注意：如果数据量巨大，list() 可能会爆内存。但用户要求复用，意味着必须缓存。
+                # DataManager.fetch_frames_iter 返回的是 cursor，只能遍历一次。
+                # 必须将其转为 list 才能多次使用。
+                cursor = DataManager.fetch_frames_iter(dataset, collection)
+                self._frames_iter_cache = list(cursor)
+            except Exception as e:
+                logger.error(f"[{self.recording_uuid}] Frames Iter Init Failed: {e}")
+                self._frames_iter_cache = []
+            finally:
+                self._frames_iter_event.set()
+                # frames_iter 准备好后，触发 source_catalog 初始化
+                threading.Thread(target=_init_source_catalog, daemon=True).start()
+
+        # 启动 Frames Iter 加载线程
+        threading.Thread(target=_init_frames_iter, daemon=True).start()
 
         # 2. 顺序任务重组缓冲区 (Reordering Buffer)
         # 不再使用单线程池，而是通过缓冲区实现并发计算 + 顺序提交
@@ -100,20 +131,30 @@ class RerunSession:
         logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
 
     @property
+    def frames_iter(self):
+        """懒加载获取 frames_iter (List)，如果未完成则阻塞等待"""
+        self._frames_iter_event.wait()
+        return self._frames_iter_cache
+
+    @property
     def source_catalog(self):
         """懒加载获取 source_catalog，如果未完成则阻塞等待"""
         # 等待初始化线程完成
         self._source_catalog_event.wait()
         return self._source_catalog_cache
 
-    def _enqueue_payload(self, priority, idx, payload):
-        """统一入队封装，解决 dict 不可比较导致的 crash"""
+    def _enqueue_seq(self, idx, payload):
+        """顺序数据入队 (FIFO)"""
+        # 顺序数据直接入队，不需要 priority/count，因为是 FIFO
+        self.seq_queue.put((idx, payload), block=True)
+
+    def _enqueue_async(self, priority, idx, payload):
+        """异步数据入队 (Priority)"""
         with self.queue_lock:
             count = self.log_queue_counter
             self.log_queue_counter += 1
         # 结构：(priority, idx, count, payload)
-        # 只要 priority 和 idx 相同，count 必定不同，永远不会比较 payload
-        self.log_queue.put((priority, idx, count, payload), block=True)
+        self.async_queue.put((priority, idx, count, payload), block=True)
 
     def heartbeat(self):
         """外部调用此方法续命"""
@@ -206,8 +247,8 @@ class RerunSession:
 
             )
             if payload:
-                # 使用动态优先级
-                self._enqueue_payload(prio, idx, payload)
+                # 入顺序队列
+                self._enqueue_seq(idx, payload)
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
 
@@ -224,9 +265,8 @@ class RerunSession:
                 source_catalog=self.source_catalog,
             )
             if payload:
-                # 计算完后塞进队列，由 sender_loop 补发图像
-                # 使用动态优先级
-                self._enqueue_payload(prio, idx, payload)
+                # 入异步队列
+                self._enqueue_async(prio, idx, payload)
         except Exception as e:
             logger.error(f"Async Task Error at frame {idx}: {e}")
     
@@ -238,8 +278,13 @@ class RerunSession:
             while self.is_playing and (time.time() - wait_start < 2.0):
                 time.sleep(0.1)
         self.stop_signal.clear()
-        while not self.log_queue.empty():
-            try: self.log_queue.get_nowait()
+        
+        # 清空两个队列
+        while not self.seq_queue.empty():
+            try: self.seq_queue.get_nowait()
+            except: break
+        while not self.async_queue.empty():
+            try: self.async_queue.get_nowait()
             except: break
 
         with self.play_lock:
@@ -247,42 +292,92 @@ class RerunSession:
             self.max_frame_idx = 0
 
         try:
-            # --- B. 启动发送者线程 (Consumer) ---
-            def sender_loop():
-                logger.info(f"[{self.recording_uuid}] Sender Loop 已启动")
+            # --- B1. 启动顺序发送者 (1 Thread, FIFO) ---
+            def seq_sender_loop():
+                logger.info(f"[{self.recording_uuid}] Seq Sender Loop (Strict Order) Started")
                 try:
-                    while not self.stop_signal.is_set() or not self.log_queue.empty():
+                    while not self.stop_signal.is_set():
                         try:
-                            item = self.log_queue.get(timeout=0.5)
-                            # 解包：priority, idx, count, payload
-                            _, idx, _, payload = item
+                            # 批量获取以减少锁开销，但必须保证 FIFO
+                            batch_items = []
                             try:
-                                with self.log_lock:
-                                    self.stream.set_time("frame_idx", sequence=idx)
-                                    for path, component in payload.items():
-                                        if isinstance(component, list):
-                                            self.stream.log(path, *component)
-                                        else:
-                                            self.stream.log(path, component)
-                            except Exception as e:
-                                logger.error(f"[{self.recording_uuid}] Sender Loop Write Error: {e}")
-                            finally:
-                                self.log_queue.task_done()
+                                item = self.seq_queue.get(timeout=0.5)
+                                batch_items.append(item)
+                                for _ in range(10):
+                                    batch_items.append(self.seq_queue.get_nowait())
+                            except queue.Empty:
+                                pass
+                            
+                            if not batch_items:
+                                continue
+
+                            for item in batch_items:
+                                idx, payload = item
+                                # 注意：Rerun set_time 是线程局部的，所以多线程安全
+                                self.stream.set_time("frame_idx", sequence=idx)
+                                for path, component in payload.items():
+                                    if isinstance(component, list):
+                                        self.stream.log(path, *component)
+                                    else:
+                                        self.stream.log(path, component)
+                                self.seq_queue.task_done()
                         except queue.Empty:
                             continue
+                        except Exception as e:
+                            logger.error(f"[{self.recording_uuid}] Seq Sender Error: {e}")
                 finally:
-                    logger.info(f"[{self.recording_uuid}] Sender Loop 已关闭")
+                    logger.info(f"[{self.recording_uuid}] Seq Sender Loop Stopped")
 
-            threading.Thread(target=sender_loop, daemon=True).start()
+            # --- B2. 启动异步发送者 (N Threads, Parallel) ---
+            def async_sender_loop(thread_id):
+                logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Started")
+                try:
+                    while not self.stop_signal.is_set():
+                        try:
+                            # 批量获取
+                            batch_items = []
+                            try:
+                                item = self.async_queue.get(timeout=0.5)
+                                batch_items.append(item)
+                                for _ in range(5): # Async 可能比较大，Batch 小一点
+                                    batch_items.append(self.async_queue.get_nowait())
+                            except queue.Empty:
+                                pass
+                            
+                            if not batch_items:
+                                continue
+
+                            for item in batch_items:
+                                _, idx, _, payload = item
+                                self.stream.set_time("frame_idx", sequence=idx)
+                                for path, component in payload.items():
+                                    if isinstance(component, list):
+                                        self.stream.log(path, *component)
+                                    else:
+                                        self.stream.log(path, component)
+                                self.async_queue.task_done()
+                        except queue.Empty:
+                            continue
+                        except Exception as e:
+                            logger.error(f"[{self.recording_uuid}] Async Sender #{thread_id} Error: {e}")
+                finally:
+                    logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Stopped")
+
+            # 启动线程
+            threading.Thread(target=seq_sender_loop, daemon=True).start()
+            
+            for i in range(SENDER_THREAD_COUNT):
+                threading.Thread(target=async_sender_loop, args=(i,), daemon=True).start()
 
             # --- C. 推送历史数据 (Producer) ---
             logger.info(f"[{self.recording_uuid}] 开始全速流水线加载...")
-            frames_iter = DataManager.fetch_frames_iter(self.dataset, self.collection)
+            # 复用已缓存的 frames_iter
+            frames_list = self.frames_iter
             
             batch = []
             batch_size = 15 # 增大 Batch，喂饱线程池
             
-            for i, doc in enumerate(frames_iter):
+            for i, doc in enumerate(frames_list):
                 if self.stop_signal.is_set() or self.is_dead: 
                     logger.info(f"[{self.recording_uuid}] 检测到 Session 销毁，停止读取数据")
                     break
@@ -315,11 +410,20 @@ class RerunSession:
         
         logger.info(f"[{self.recording_uuid}] 启动异步重计算: {label}")
 
-        # 移除 limit 参数，直接获取全部数据迭代器
-        frames_iter = DataManager.fetch_frames_iter(
-            self.dataset, 
-            self.collection
-        )
+        try:
+            # 重新获取最新数据
+            cursor = DataManager.fetch_frames_iter(
+                self.dataset, 
+                self.collection
+            )
+            # 更新缓存
+            new_frames = list(cursor)
+            self._frames_iter_cache = new_frames
+            # 确保事件已设置 (理论上应该是 set 状态，但为了保险)
+            self._frames_iter_event.set() 
+        except Exception as e:
+             logger.error(f"[{label}] Re-fetch frames failed: {e}")
+             return
 
         def _task(frame_data, idx):
             if self.is_dead or self.stop_signal.is_set(): return
@@ -337,12 +441,11 @@ class RerunSession:
                 
                 # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
                 # 使用动态优先级
-                self._enqueue_payload(prio, idx, payload)
-                
+                self._enqueue_async(prio, idx, payload)
             except Exception as e:
                 logger.error(f"[{label}] 帧 {idx} 任务失败: {e}")
 
-        for i, doc in enumerate(frames_iter):
+        for i, doc in enumerate(self.frames_iter):
             if self.stop_signal.is_set(): break
             self.process_executor.submit(_task, doc, i)
     

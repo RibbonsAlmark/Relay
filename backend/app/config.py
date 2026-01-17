@@ -16,3 +16,6 @@ WORKER_THREAD_MULTIPLIER = int(os.getenv("WORKER_THREAD_MULTIPLIER", "2"))
 
 # Backpressure queue size multiplier relative to worker threads (e.g., 4 means 4 * WORKER_THREADS)
 BACKPRESSURE_QUEUE_MULTIPLIER = int(os.getenv("BACKPRESSURE_QUEUE_MULTIPLIER", "4"))
+
+# Number of concurrent sender threads for async data (images, etc.)
+SENDER_THREAD_COUNT = int(os.getenv("SENDER_THREAD_COUNT", "4"))
