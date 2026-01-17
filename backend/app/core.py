@@ -14,6 +14,7 @@ import os
 
 from .data_provider import DataManager
 from .rerun_logger import RerunLogger
+from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER
 
 class PortManager:
     def __init__(self, start_port: int = 10000, end_port: int = 11000):
@@ -58,10 +59,15 @@ class RerunSession:
         self.play_lock = threading.Lock()
         self.stop_signal = threading.Event() 
         
+        # 2. 并发执行器：处理耗时任务（图像、点云等）
+        self.max_workers = (os.cpu_count() or 4) * WORKER_THREAD_MULTIPLIER
+        self.process_executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
         # --- 【背压控制】 ---
         # 使用 PriorityQueue 实现优先级控制
         # 优先级定义：0 (高，Pose/Seq) < 10 (低，Image/Async)
-        self.log_queue = queue.PriorityQueue(maxsize=32)
+        # 队列大小与线程数挂钩
+        self.log_queue = queue.PriorityQueue(maxsize=self.max_workers * BACKPRESSURE_QUEUE_MULTIPLIER)
         self.log_queue_counter = 0  # 用于解决 PriorityQueue 优先级相同时的排序冲突
         self.queue_lock = threading.Lock() # 保护 counter 的线程安全
         self.max_frame_idx = 0 
@@ -80,8 +86,6 @@ class RerunSession:
         # 所有的 PoseProcessor 任务都提交到这里，它们会排队，绝不超车
         self.seq_executor = ThreadPoolExecutor(max_workers=1)
         
-        # 2. 并发执行器：处理耗时任务（图像、点云等）
-        self.process_executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
 
         # 内存限制 10MB
         memory_limit = "10MB"

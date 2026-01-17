@@ -6,3 +6,5 @@ requests
 pymongo==4.8.0
 open3d
 psutil
+torch
+torchvision

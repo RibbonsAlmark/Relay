@@ -9,7 +9,7 @@ class PriorityConfig:
     POSE = 9
     JOINT = 1
     
-    # 关键业务数据
+    # 元数据（帧描述、源信息）
     META = 10
     
     # 耗时传感器数据 (Async)
