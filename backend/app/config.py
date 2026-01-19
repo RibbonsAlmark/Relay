@@ -1,4 +1,3 @@
-# app/config.py (终极简单版)
 import os
 
 BACKEND_IP = os.getenv("BACKEND_IP", "192.168.18.104")
@@ -28,3 +27,9 @@ COLOR_IMG_QUALITY = int(os.getenv("COLOR_IMG_QUALITY", "50"))
 # Depth Image
 DEPTH_IMG_MAX_WIDTH = int(os.getenv("DEPTH_IMG_MAX_WIDTH", "640"))
 DEPTH_IMG_COMPRESS = os.getenv("DEPTH_IMG_COMPRESS", "False").lower() == "true"
+
+# Batch Sending Config
+# Buffer size limit for batching (in bytes). Default: 1MB (1024 * 1024)
+BATCH_BUFFER_SIZE_LIMIT = int(os.getenv("BATCH_BUFFER_SIZE_LIMIT", str(1024 * 1024)))
+# Timeout for flushing batch buffer (in seconds). Default: 0.05 (50ms)
+BATCH_BUFFER_TIMEOUT = float(os.getenv("BATCH_BUFFER_TIMEOUT", "0.05"))

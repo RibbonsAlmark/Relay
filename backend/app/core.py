@@ -13,7 +13,8 @@ import os
 from .data_provider import DataManager
 from .rerun_logger import RerunLogger
 from .port_manager import PortManager
-from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER, SENDER_THREAD_COUNT
+from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER, SENDER_THREAD_COUNT, BATCH_BUFFER_SIZE_LIMIT, BATCH_BUFFER_TIMEOUT
+from app.utils import estimate_payload_size
 
 class RerunSession:
     def __init__(self, dataset: str, collection: str, port_manager: PortManager):
@@ -269,6 +270,34 @@ class RerunSession:
                 self._enqueue_async(prio, idx, payload)
         except Exception as e:
             logger.error(f"Async Task Error at frame {idx}: {e}")
+
+    def _flush_batch_buffer(self, local_buffer):
+        """清空并发送缓冲区"""
+        for path, items in local_buffer.items():
+            if not items: continue
+            
+            try:
+                # 按索引排序确保时序
+                items.sort(key=lambda x: x[0])
+                indices = [x[0] for x in items]
+                components = [x[1] for x in items]
+                
+                # 尝试批量发送
+                if not self._try_send_batch(path, indices, components):
+                    # 回退到逐个发送
+                    for idx, comp in items:
+                        try:
+                            self.stream.set_time("frame_idx", sequence=idx)
+                            if isinstance(comp, list):
+                                self.stream.log(path, *comp)
+                            else:
+                                self.stream.log(path, comp)
+                        except Exception as e:
+                            logger.error(f"Fallback log failed for {path} at {idx}: {e}")
+            except Exception as e:
+                logger.error(f"Flush buffer failed for {path}: {e}")
+                
+        local_buffer.clear()
     
     def play_logic(self):
         # --- A. 抢占与重置逻辑 (略，保持你现在的代码即可) ---
@@ -295,72 +324,96 @@ class RerunSession:
             # --- B1. 启动顺序发送者 (1 Thread, FIFO) ---
             def seq_sender_loop():
                 logger.info(f"[{self.recording_uuid}] Seq Sender Loop (Strict Order) Started")
+                local_buffer = {}
+                local_count = 0
+                local_buffer_size = 0
+                last_flush = time.time()
                 try:
                     while not self.stop_signal.is_set():
+                        batch_items = []
                         try:
                             # 批量获取以减少锁开销，但必须保证 FIFO
-                            batch_items = []
                             try:
-                                item = self.seq_queue.get(timeout=0.5)
+                                item = self.seq_queue.get(timeout=0.1)
                                 batch_items.append(item)
-                                for _ in range(10):
+                                for _ in range(20):
                                     batch_items.append(self.seq_queue.get_nowait())
                             except queue.Empty:
                                 pass
                             
-                            if not batch_items:
-                                continue
+                            if batch_items:
+                                for item in batch_items:
+                                    idx, payload = item
+                                    # 估算 payload 大小
+                                    local_buffer_size += estimate_payload_size(payload)
+                                    
+                                    for path, component in payload.items():
+                                        if path not in local_buffer: local_buffer[path] = []
+                                        local_buffer[path].append((idx, component))
+                                        local_count += 1
+                                    self.seq_queue.task_done()
 
-                            for item in batch_items:
-                                idx, payload = item
-                                # 注意：Rerun set_time 是线程局部的，所以多线程安全
-                                self.stream.set_time("frame_idx", sequence=idx)
-                                for path, component in payload.items():
-                                    if isinstance(component, list):
-                                        self.stream.log(path, *component)
-                                    else:
-                                        self.stream.log(path, component)
-                                self.seq_queue.task_done()
-                        except queue.Empty:
-                            continue
+                            # 检查刷新条件: 大小达标 或 时间超时 或 队列暂时空了
+                            now = time.time()
+                            if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
+                                self._flush_batch_buffer(local_buffer)
+                                local_count = 0
+                                local_buffer_size = 0
+                                last_flush = now
+                                
                         except Exception as e:
                             logger.error(f"[{self.recording_uuid}] Seq Sender Error: {e}")
                 finally:
+                    # 退出前强制刷新剩余数据
+                    if local_count > 0:
+                        self._flush_batch_buffer(local_buffer)
                     logger.info(f"[{self.recording_uuid}] Seq Sender Loop Stopped")
 
             # --- B2. 启动异步发送者 (N Threads, Parallel) ---
             def async_sender_loop(thread_id):
                 logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Started")
+                local_buffer = {}
+                local_count = 0
+                local_buffer_size = 0
+                last_flush = time.time()
                 try:
                     while not self.stop_signal.is_set():
+                        batch_items = []
                         try:
                             # 批量获取
-                            batch_items = []
                             try:
-                                item = self.async_queue.get(timeout=0.5)
+                                item = self.async_queue.get(timeout=0.1)
                                 batch_items.append(item)
-                                for _ in range(5): # Async 可能比较大，Batch 小一点
+                                for _ in range(10): 
                                     batch_items.append(self.async_queue.get_nowait())
                             except queue.Empty:
                                 pass
                             
-                            if not batch_items:
-                                continue
-
-                            for item in batch_items:
-                                _, idx, _, payload = item
-                                self.stream.set_time("frame_idx", sequence=idx)
-                                for path, component in payload.items():
-                                    if isinstance(component, list):
-                                        self.stream.log(path, *component)
-                                    else:
-                                        self.stream.log(path, component)
-                                self.async_queue.task_done()
-                        except queue.Empty:
-                            continue
+                            if batch_items:
+                                for item in batch_items:
+                                    _, idx, _, payload = item
+                                    # 估算 payload 大小
+                                    local_buffer_size += estimate_payload_size(payload)
+                                    
+                                    for path, component in payload.items():
+                                        if path not in local_buffer: local_buffer[path] = []
+                                        local_buffer[path].append((idx, component))
+                                        local_count += 1
+                                    self.async_queue.task_done()
+                            
+                            # 检查刷新条件
+                            now = time.time()
+                            if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
+                                self._flush_batch_buffer(local_buffer)
+                                local_count = 0
+                                local_buffer_size = 0
+                                last_flush = now
                         except Exception as e:
                             logger.error(f"[{self.recording_uuid}] Async Sender #{thread_id} Error: {e}")
                 finally:
+                    # 退出前强制刷新剩余数据
+                    if local_count > 0:
+                        self._flush_batch_buffer(local_buffer)
                     logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Stopped")
 
             # 启动线程
