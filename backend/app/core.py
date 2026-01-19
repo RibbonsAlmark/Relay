@@ -172,24 +172,29 @@ class RerunSession:
 
             # 1. Transform3D (PoseProcessor)
             if isinstance(first, rr.Transform3D):
-                translations = [c.translation for c in components]
-                rotations = [c.rotation for c in components]
-                rr.send_columns(
-                    path,
-                    indexes=[time_col],
-                    columns=rr.Transform3D.columns(translation=translations, rotation=rotations)
-                )
-                return True
+                # [Fix] Transform3D 内部属性提取在不同版本中可能不一致，
+                # 为保证顺序数据的绝对正确性，暂时禁用批量发送，回退到标准 log。
+                return False
+                # translations = [c.translation for c in components]
+                # rotations = [c.rotation for c in components]
+                # rr.send_columns(
+                #     path,
+                #     indexes=[time_col],
+                #     columns=rr.Transform3D.columns(translation=translations, rotation=rotations)
+                # )
+                # return True
 
             # 2. TransformAxes3D (PoseProcessor)
             elif isinstance(first, rr.TransformAxes3D):
-                axis_lengths = [c.axis_length for c in components]
-                rr.send_columns(
-                    path,
-                    indexes=[time_col],
-                    columns=rr.TransformAxes3D.columns(axis_length=axis_lengths)
-                )
-                return True
+                # [Fix] 同上，保证正确性
+                return False
+                # axis_lengths = [c.axis_length for c in components]
+                # rr.send_columns(
+                #     path,
+                #     indexes=[time_col],
+                #     columns=rr.TransformAxes3D.columns(axis_length=axis_lengths)
+                # )
+                # return True
 
             # 3. Scalars (JointProcessor)
             elif isinstance(first, rr.Scalars):

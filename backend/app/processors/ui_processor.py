@@ -43,19 +43,19 @@ class UIProcessor(BaseProcessor):
                 media_type=rr.MediaType.MARKDOWN
             )
 
-        # --- 2. 生成并 Yield Pro版面板 ---
-        panel_content = RerunInterfaceHelper.generate_frame_panel_pro(
-            doc, 
-            frame_idx, 
-            backend_host=BACKEND_HOST,
-            src_db=src_db,
-            src_col=src_col,
-            recording_uuid=recording_uuid
-        )
+        # # --- 2. 生成并 Yield Pro版面板 ---
+        # panel_content = RerunInterfaceHelper.generate_frame_panel_pro(
+        #     doc, 
+        #     frame_idx, 
+        #     backend_host=BACKEND_HOST,
+        #     src_db=src_db,
+        #     src_col=src_col,
+        #     recording_uuid=recording_uuid
+        # )
         
-        # 2. 流式返回结果
-        if panel_content:
-            yield "rating_panel_pro", rr.TextDocument(
-                panel_content, 
-                media_type=rr.MediaType.MARKDOWN
-            )
+        # # 2. 流式返回结果
+        # if panel_content:
+        #     yield "rating_panel_pro", rr.TextDocument(
+        #         panel_content, 
+        #         media_type=rr.MediaType.MARKDOWN
+        #     )
