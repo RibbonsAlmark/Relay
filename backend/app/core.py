@@ -157,6 +157,63 @@ class RerunSession:
         # 结构：(priority, idx, count, payload)
         self.async_queue.put((priority, idx, count, payload), block=True)
 
+    def _try_send_batch(self, path, indices, components):
+        """尝试使用 send_columns 进行批量发送"""
+        if not hasattr(rr, 'send_columns') or not components:
+            return False
+
+        try:
+            first = components[0]
+            # 统一时间列 - 兼容不同版本
+            if hasattr(rr, 'TimeSequenceColumn'):
+                time_col = rr.TimeSequenceColumn("frame_idx", indices)
+            else:
+                time_col = rr.TimeColumn("frame_idx", sequence=indices)
+
+            # 1. Transform3D (PoseProcessor)
+            if isinstance(first, rr.Transform3D):
+                translations = [c.translation for c in components]
+                rotations = [c.rotation for c in components]
+                rr.send_columns(
+                    path,
+                    indexes=[time_col],
+                    columns=rr.Transform3D.columns(translation=translations, rotation=rotations)
+                )
+                return True
+
+            # 2. TransformAxes3D (PoseProcessor)
+            elif isinstance(first, rr.TransformAxes3D):
+                axis_lengths = [c.axis_length for c in components]
+                rr.send_columns(
+                    path,
+                    indexes=[time_col],
+                    columns=rr.TransformAxes3D.columns(axis_length=axis_lengths)
+                )
+                return True
+
+            # 3. Scalars (JointProcessor)
+            elif isinstance(first, rr.Scalars):
+                vals = []
+                for c in components:
+                    s = getattr(c, 'scalars', None)
+                    if hasattr(s, '__len__') and len(s) == 1:
+                        vals.append(s[0])
+                    else:
+                        vals.append(s)
+                
+                rr.send_columns(
+                    path,
+                    indexes=[time_col],
+                    columns=rr.Scalars.columns(scalars=vals)
+                )
+                return True
+
+            return False
+
+        except Exception as e:
+            # logger.warning(f"Batch send failed for {path}: {e}")
+            return False
+
     def heartbeat(self):
         """外部调用此方法续命"""
         self.last_heartbeat = time.time()
