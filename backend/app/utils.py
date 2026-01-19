@@ -10,44 +10,51 @@ def find_free_port() -> int:
 
 def estimate_payload_size(payload) -> int:
     """
-    估算 Rerun payload (Dict[str, Any]) 的大小（字节）。
-    主要关注 numpy array 和 bytes 等大对象，其他对象使用递归估算。
+    极速估算 Rerun payload 大小（启发式）。
+    避免递归，仅检查顶层组件，大幅降低 CPU 开销。
     """
     size = 0
+    if not payload: return 0
+    
     try:
-        if isinstance(payload, dict):
-            for k, v in payload.items():
-                size += sys.getsizeof(k)
-                size += _estimate_value_size(v)
-        else:
-            size += _estimate_value_size(payload)
+        # 只需要遍历顶层 Values
+        for v in payload.values():
+            # 1. 显式检查 numpy/bytes (图片/Tensor)
+            if hasattr(v, 'nbytes'):
+                size += v.nbytes
+            elif isinstance(v, (bytes, bytearray)):
+                size += len(v)
+            
+            # 2. 检查 Rerun Archetype/Component (通常有 data 属性)
+            elif hasattr(v, 'data'):
+                d = v.data
+                if hasattr(d, 'nbytes'):
+                    size += d.nbytes
+                elif isinstance(d, (bytes, bytearray)):
+                    size += len(d)
+                else:
+                    size += 200 # 默认小对象
+            
+            # 3. 列表 (可能是 batch)
+            elif isinstance(v, list):
+                if v:
+                    # 只看第一个元素来粗略估算整个列表
+                    first = v[0]
+                    est = 100
+                    if hasattr(first, 'nbytes'): est = first.nbytes
+                    size += est * len(v)
+            
+            # 4. 其他默认极小
+            else:
+                size += 100
+                
     except Exception:
-        pass 
+        # 出错忽略，返回一个非零默认值避免除零等问题
+        return 1024
+        
     return size
 
 def _estimate_value_size(obj, depth=0) -> int:
-    if depth > 3: return 0
-    
-    if isinstance(obj, (np.ndarray,)):
-        return obj.nbytes
-    elif hasattr(obj, 'nbytes'): 
-        return obj.nbytes
-    elif isinstance(obj, (bytes, bytearray)):
-        return len(obj)
-    elif isinstance(obj, str):
-        return len(obj.encode('utf-8'))
-    elif isinstance(obj, list):
-        if not obj: return 0
-        s = 0
-        for item in obj:
-            s += _estimate_value_size(item, depth+1)
-        return s
-    
-    # 尝试递归计算对象属性（针对 Rerun Archetypes）
-    if hasattr(obj, '__dict__'):
-        s = sys.getsizeof(obj)
-        for v in obj.__dict__.values():
-            s += _estimate_value_size(v, depth+1)
-        return s
-    
-    return sys.getsizeof(obj)
+    # 保留此函数但不使用，或直接删除。
+    # 为保持兼容性暂时保留，但不再被主逻辑调用。
+    return 0
