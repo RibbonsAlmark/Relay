@@ -19,3 +19,12 @@ BACKPRESSURE_QUEUE_MULTIPLIER = int(os.getenv("BACKPRESSURE_QUEUE_MULTIPLIER", "
 
 # Number of concurrent sender threads for async data (images, etc.)
 SENDER_THREAD_COUNT = int(os.getenv("SENDER_THREAD_COUNT", "4"))
+
+# Image Compression Config
+# Color Image
+COLOR_IMG_MAX_WIDTH = int(os.getenv("COLOR_IMG_MAX_WIDTH", "1024"))
+COLOR_IMG_QUALITY = int(os.getenv("COLOR_IMG_QUALITY", "50"))
+
+# Depth Image
+DEPTH_IMG_MAX_WIDTH = int(os.getenv("DEPTH_IMG_MAX_WIDTH", "640"))
+DEPTH_IMG_COMPRESS = os.getenv("DEPTH_IMG_COMPRESS", "False").lower() == "true"

@@ -10,6 +10,7 @@ from .processors.joint_processor import JointProcessor
 from .processors.pose_processor import PoseProcessor
 from .processors.lidar_processor import LidarProcessor
 from .processors.meta_processor import MetaProcessor
+from .processors.tf_processor import TransformProcessor
 
 class RerunLogger:
     # 存储类引用，而不是实例对象
@@ -20,6 +21,7 @@ class RerunLogger:
         PoseProcessor,
         LidarProcessor,
         MetaProcessor,
+        TransformProcessor,
     ]
     
     @classmethod
