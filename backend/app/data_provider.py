@@ -65,6 +65,16 @@ class DataManager:
         return result
 
     @staticmethod
+    def get_collection_count(database: str, collection: str) -> int:
+        """获取集合文档总数"""
+        client = DataManager.get_client()
+        try:
+            return client.count(database, collection)
+        except Exception as e:
+            logger.error(f"Failed to get collection count for {database}.{collection}: {e}")
+            return 0
+
+    @staticmethod
     def get_frame_range(database: str, collection: str) -> Tuple[int, int]:
         """
         获取数据集的帧范围 (Start, End)

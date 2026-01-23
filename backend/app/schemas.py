@@ -4,6 +4,7 @@ from typing import Optional
 class CreateSourceConfig(BaseModel):
     dataset: str
     collection: str
+    alignment_mode: Optional[bool] = False # 是否开启对齐模式 (保证同一帧的数据打包发送)
 
 class SourceResponse(BaseModel):
     status: str
@@ -11,6 +12,7 @@ class SourceResponse(BaseModel):
     recording_uuid: str
     port: int
     connect_url: str
+    max_frame_idx: Optional[int] = 0 # 数据集最大帧索引 (用于前端边界判断)
 
 # 1. 定义基础评分配置 (Base Class)
 class BaseRateConfig(BaseModel):

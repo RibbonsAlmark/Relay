@@ -12,7 +12,10 @@
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
+import { RERUN_CONFIG } from '../config';
+
+const rerunFrame = ref(null);
 
 const props = defineProps({
   // 1. 可以是一个本地或远程的 .rrd 文件地址
@@ -23,11 +26,28 @@ const props = defineProps({
   }
 });
 
+// 向父组件暴露获取 window 的方法
+const getWindow = () => {
+  return rerunFrame.value?.contentWindow;
+};
+
+defineExpose({
+  getWindow
+});
+
 // 构建 Rerun Web Viewer 的 URL
 // 我们利用官方托管的 app.rerun.io，并通过 url 参数传递数据源
 const viewerUrl = computed(() => {
-  const baseUrl = import.meta.env.VITE_RERUN_VIEWER_BASE || 'http://localhost:9092/';
-  return `${baseUrl}?url=${encodeURIComponent(props.source)}`;
+  let url = `${RERUN_CONFIG.VIEWER_BASE}?url=${encodeURIComponent(props.source)}`;
+  
+  // 启用流式控制参数：
+  // streaming_enabled=true: 开启时间广播 postMessage 和手动 drop_time_range 接口
+  // pause_on_no_data=true: 开启无数据/断档自动暂停保护
+  if (RERUN_CONFIG.STREAMING_MODE) {
+    url += '&streaming_enabled=true&pause_on_no_data=true';
+  }
+  
+  return url;
 });
 </script>
 

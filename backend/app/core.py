@@ -46,6 +46,12 @@ class RerunSession:
         
         # 2. 异步队列 (Async Queue): PriorityQueue, 支持并发发送, 由 SENDER_THREAD_COUNT 个线程消费
         self.async_queue = queue.PriorityQueue(maxsize=self.max_workers * BACKPRESSURE_QUEUE_MULTIPLIER)
+
+        # 3. 对齐队列 (Alignment Queue): 用于存放已合并完整帧的队列
+        self.alignment_mode = False
+        self.alignment_buffer = {} # {idx: {'seq': ..., 'async': ..., 'count': 0}}
+        self.alignment_lock = threading.Lock()
+        self.aligned_queue = queue.PriorityQueue(maxsize=self.max_workers * BACKPRESSURE_QUEUE_MULTIPLIER)
         
         self.log_queue_counter = 0  # 用于解决 PriorityQueue 优先级相同时的排序冲突
         self.queue_lock = threading.Lock() # 保护 counter 的线程安全
@@ -142,7 +148,120 @@ class RerunSession:
         self.seq_buffer = []  # Heapq: (idx, prio, payload)
         self.seq_lock = threading.Lock()
         
+        # --- 启动消费者线程 (Senders) ---
+        # 无论是否处于“播放”状态，消费者线程都必须常驻，以处理 load_range 等按需请求
+        self._start_sender_threads()
+
         logger.info(f"[{self.recording_uuid}] Session initialized on port {self.port} (Limit: {memory_limit})")
+
+    def _start_sender_threads(self):
+        """启动所有发送队列的消费者线程"""
+        
+        # --- B1. 启动顺序发送者 (1 Thread, FIFO) ---
+        def seq_sender_loop():
+            logger.info(f"[{self.recording_uuid}] Seq Sender Loop (Strict Order) Started")
+            local_buffer = {}
+            local_count = 0
+            local_buffer_size = 0
+            last_flush = time.time()
+            try:
+                while not self.is_dead: # 改为检查 is_dead，只要 Session 活着就一直运行
+                    batch_items = []
+                    try:
+                        # 批量获取以减少锁开销，但必须保证 FIFO
+                        try:
+                            item = self.seq_queue.get(timeout=0.1)
+                            batch_items.append(item)
+                            for _ in range(20):
+                                batch_items.append(self.seq_queue.get_nowait())
+                        except queue.Empty:
+                            pass
+                        
+                        if batch_items:
+                            for item in batch_items:
+                                idx, payload = item
+                                # 估算 payload 大小
+                                local_buffer_size += estimate_payload_size(payload)
+                                
+                                for path, component in payload.items():
+                                    if path not in local_buffer: local_buffer[path] = []
+                                    local_buffer[path].append((idx, component))
+                                    local_count += 1
+                                self.seq_queue.task_done()
+
+                        # 检查刷新条件: 大小达标 或 时间超时 或 队列暂时空了
+                        now = time.time()
+                        if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
+                            self._flush_batch_buffer(local_buffer)
+                            local_count = 0
+                            local_buffer_size = 0
+                            last_flush = now
+                            
+                    except Exception as e:
+                        logger.error(f"[{self.recording_uuid}] Seq Sender Error: {e}")
+            finally:
+                # 退出前强制刷新剩余数据
+                if local_count > 0:
+                    self._flush_batch_buffer(local_buffer)
+                logger.info(f"[{self.recording_uuid}] Seq Sender Loop Stopped")
+
+        # --- B2. 启动异步发送者 (N Threads, Parallel) ---
+        def async_sender_loop(thread_id, target_queue, queue_name):
+            logger.info(f"[{self.recording_uuid}] {queue_name} Sender #{thread_id} Started")
+            local_buffer = {}
+            local_count = 0
+            local_buffer_size = 0
+            last_flush = time.time()
+            try:
+                while not self.is_dead: # 改为检查 is_dead
+                    batch_items = []
+                    try:
+                        # 批量获取
+                        try:
+                            item = target_queue.get(timeout=0.1)
+                            batch_items.append(item)
+                            for _ in range(10): 
+                                batch_items.append(target_queue.get_nowait())
+                        except queue.Empty:
+                            pass
+                        
+                        if batch_items:
+                            for item in batch_items:
+                                _, idx, _, payload = item
+                                # 估算 payload 大小
+                                local_buffer_size += estimate_payload_size(payload)
+                                
+                                for path, component in payload.items():
+                                    if path not in local_buffer: local_buffer[path] = []
+                                    local_buffer[path].append((idx, component))
+                                    local_count += 1
+                                target_queue.task_done()
+                        
+                        # 检查刷新条件
+                        now = time.time()
+                        if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
+                            self._flush_batch_buffer(local_buffer)
+                            local_count = 0
+                            local_buffer_size = 0
+                            last_flush = now
+                    except Exception as e:
+                        logger.error(f"[{self.recording_uuid}] {queue_name} Sender #{thread_id} Error: {e}")
+            finally:
+                # 退出前强制刷新剩余数据
+                if local_count > 0:
+                    self._flush_batch_buffer(local_buffer)
+                logger.info(f"[{self.recording_uuid}] {queue_name} Sender #{thread_id} Stopped")
+
+        # 启动线程
+        threading.Thread(target=seq_sender_loop, daemon=True).start()
+        
+        # 启动 Async Queue Consumers
+        for i in range(SENDER_THREAD_COUNT):
+            threading.Thread(target=async_sender_loop, args=(i, self.async_queue, "Async"), daemon=True).start()
+
+        # 启动 Aligned Queue Consumers
+        threading.Thread(target=async_sender_loop, args=(0, self.aligned_queue, "Aligned"), daemon=True).start()
+
 
     @property
     def frames_iter(self):
@@ -156,6 +275,54 @@ class RerunSession:
         # 等待初始化线程完成
         self._source_catalog_event.wait()
         return self._source_catalog_cache
+
+    def set_alignment_mode(self, enabled: bool):
+        """动态切换对齐模式"""
+        logger.info(f"[{self.recording_uuid}] Alignment Mode set to {enabled}")
+        self.alignment_mode = enabled
+
+    def _handle_alignment_merge(self, idx, part_type, payload, priority=10):
+        """
+        [Alignment Mode] 数据汇聚核心逻辑
+        等待 seq 和 async 两部分都到达后，合并为一个 Payload 入队
+        """
+        ready_item = None
+        with self.alignment_lock:
+            if idx not in self.alignment_buffer:
+                self.alignment_buffer[idx] = {'seq': None, 'async': None, 'count': 0, 'prio': priority}
+            
+            entry = self.alignment_buffer[idx]
+            entry[part_type] = payload
+            entry['count'] += 1
+            
+            # 如果是 async 数据，更新优先级（通常 async 带有图像处理的优先级）
+            if part_type == 'async':
+                entry['prio'] = priority
+
+            # 检查是否收齐 (需要 seq 和 async 各回报一次，共 2 次)
+            if entry['count'] >= 2:
+                # 合并 Payload
+                merged_payload = {}
+                if entry['seq']: merged_payload.update(entry['seq'])
+                if entry['async']: merged_payload.update(entry['async'])
+                
+                # 准备入队数据
+                prio = entry['prio']
+                
+                # 清理 Buffer
+                del self.alignment_buffer[idx]
+                
+                # 只有当有数据时才发送
+                if merged_payload:
+                    ready_item = (prio, merged_payload)
+
+        # 在锁外获取 queue counter 并入队，减少锁竞争
+        if ready_item:
+            prio, payload = ready_item
+            with self.queue_lock:
+                count = self.log_queue_counter
+                self.log_queue_counter += 1
+            self.aligned_queue.put((prio, idx, count, payload))
 
     def _enqueue_seq(self, idx, payload):
         """顺序数据入队 (FIFO)"""
@@ -293,16 +460,19 @@ class RerunSession:
         # --- 3. 提交至常驻线程池 ---
         # 瞬间提交所有帧，不阻塞主线程，实现 I/O 与计算的分离
         try:
+            # 获取当前模式快照，确保同一帧的任务处理逻辑一致
+            use_alignment = self.alignment_mode
+
             for i, frame_data in enumerate(frames):
                 idx = base_idx + i
                 
                 # --- 分支 A: 顺序支流 ---
                 # 仅仅是提交任务，瞬间完成，不阻塞读取
-                self.seq_executor.submit(self._seq_task_handler, frame_data, idx)
+                self.seq_executor.submit(self._seq_task_handler, frame_data, idx, use_alignment)
 
                 # --- 分支 B: 异步支流 ---
                 # 依然由多线程池全速计算图像
-                self.process_executor.submit(self._async_task_handler, frame_data, idx)
+                self.process_executor.submit(self._async_task_handler, frame_data, idx, use_alignment)
             
             return True
         except Exception as e:
@@ -347,7 +517,7 @@ class RerunSession:
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] Load range failed: {e}")
 
-    def _seq_task_handler(self, frame_data, idx):
+    def _seq_task_handler(self, frame_data, idx, use_alignment=False):
         """这个函数由于在 max_workers=1 的线程池运行，天然具备顺序性"""
         if self.is_dead or self.stop_signal.is_set(): return
         try:
@@ -360,13 +530,21 @@ class RerunSession:
                 source_catalog=self.source_catalog,
 
             )
-            if payload:
-                # 入顺序队列
+            
+            if use_alignment:
+                # 对齐模式：无论是否有 payload，都必须汇报
+                self._handle_alignment_merge(idx, 'seq', payload, prio)
+            elif payload:
+                # 传统模式：只入队有数据的
                 self._enqueue_seq(idx, payload)
+                
         except Exception as e:
             logger.error(f"Sequential Task Error at frame {idx}: {e}")
+            if use_alignment:
+                # 异常时也要汇报，防止死锁
+                self._handle_alignment_merge(idx, 'seq', None)
 
-    def _async_task_handler(self, frame_data, idx):
+    def _async_task_handler(self, frame_data, idx, use_alignment=False):
         """在多线程池运行，处理图像等耗时项"""
         if self.is_dead or self.stop_signal.is_set(): return
         try:
@@ -378,11 +556,17 @@ class RerunSession:
                 recording_uuid=self.recording_uuid,
                 source_catalog=self.source_catalog,
             )
-            if payload:
+            
+            if use_alignment:
+                self._handle_alignment_merge(idx, 'async', payload, prio)
+            elif payload:
                 # 入异步队列
                 self._enqueue_async(prio, idx, payload)
+                
         except Exception as e:
             logger.error(f"Async Task Error at frame {idx}: {e}")
+            if use_alignment:
+                self._handle_alignment_merge(idx, 'async', None)
 
     def _flush_batch_buffer(self, local_buffer):
         """清空并发送缓冲区"""
@@ -413,7 +597,7 @@ class RerunSession:
         local_buffer.clear()
     
     def play_logic(self):
-        # --- A. 抢占与重置逻辑 (略，保持你现在的代码即可) ---
+        # --- A. 抢占与重置逻辑 ---
         if self.is_playing:
             self.stop_signal.set()
             wait_start = time.time()
@@ -421,12 +605,15 @@ class RerunSession:
                 time.sleep(0.1)
         self.stop_signal.clear()
         
-        # 清空两个队列
+        # 清空两个队列 (可选，视需求而定，这里保留以确保全新的播放开始)
         while not self.seq_queue.empty():
             try: self.seq_queue.get_nowait()
             except: break
         while not self.async_queue.empty():
             try: self.async_queue.get_nowait()
+            except: break
+        while not self.aligned_queue.empty():
+            try: self.aligned_queue.get_nowait()
             except: break
 
         with self.play_lock:
@@ -434,106 +621,8 @@ class RerunSession:
             self.max_frame_idx = 0
 
         try:
-            # --- B1. 启动顺序发送者 (1 Thread, FIFO) ---
-            def seq_sender_loop():
-                logger.info(f"[{self.recording_uuid}] Seq Sender Loop (Strict Order) Started")
-                local_buffer = {}
-                local_count = 0
-                local_buffer_size = 0
-                last_flush = time.time()
-                try:
-                    while not self.stop_signal.is_set():
-                        batch_items = []
-                        try:
-                            # 批量获取以减少锁开销，但必须保证 FIFO
-                            try:
-                                item = self.seq_queue.get(timeout=0.1)
-                                batch_items.append(item)
-                                for _ in range(20):
-                                    batch_items.append(self.seq_queue.get_nowait())
-                            except queue.Empty:
-                                pass
-                            
-                            if batch_items:
-                                for item in batch_items:
-                                    idx, payload = item
-                                    # 估算 payload 大小
-                                    local_buffer_size += estimate_payload_size(payload)
-                                    
-                                    for path, component in payload.items():
-                                        if path not in local_buffer: local_buffer[path] = []
-                                        local_buffer[path].append((idx, component))
-                                        local_count += 1
-                                    self.seq_queue.task_done()
-
-                            # 检查刷新条件: 大小达标 或 时间超时 或 队列暂时空了
-                            now = time.time()
-                            if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
-                                self._flush_batch_buffer(local_buffer)
-                                local_count = 0
-                                local_buffer_size = 0
-                                last_flush = now
-                                
-                        except Exception as e:
-                            logger.error(f"[{self.recording_uuid}] Seq Sender Error: {e}")
-                finally:
-                    # 退出前强制刷新剩余数据
-                    if local_count > 0:
-                        self._flush_batch_buffer(local_buffer)
-                    logger.info(f"[{self.recording_uuid}] Seq Sender Loop Stopped")
-
-            # --- B2. 启动异步发送者 (N Threads, Parallel) ---
-            def async_sender_loop(thread_id):
-                logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Started")
-                local_buffer = {}
-                local_count = 0
-                local_buffer_size = 0
-                last_flush = time.time()
-                try:
-                    while not self.stop_signal.is_set():
-                        batch_items = []
-                        try:
-                            # 批量获取
-                            try:
-                                item = self.async_queue.get(timeout=0.1)
-                                batch_items.append(item)
-                                for _ in range(10): 
-                                    batch_items.append(self.async_queue.get_nowait())
-                            except queue.Empty:
-                                pass
-                            
-                            if batch_items:
-                                for item in batch_items:
-                                    _, idx, _, payload = item
-                                    # 估算 payload 大小
-                                    local_buffer_size += estimate_payload_size(payload)
-                                    
-                                    for path, component in payload.items():
-                                        if path not in local_buffer: local_buffer[path] = []
-                                        local_buffer[path].append((idx, component))
-                                        local_count += 1
-                                    self.async_queue.task_done()
-                            
-                            # 检查刷新条件
-                            now = time.time()
-                            if local_count > 0 and (local_buffer_size >= BATCH_BUFFER_SIZE_LIMIT or now - last_flush > BATCH_BUFFER_TIMEOUT or not batch_items):
-                                self._flush_batch_buffer(local_buffer)
-                                local_count = 0
-                                local_buffer_size = 0
-                                last_flush = now
-                        except Exception as e:
-                            logger.error(f"[{self.recording_uuid}] Async Sender #{thread_id} Error: {e}")
-                finally:
-                    # 退出前强制刷新剩余数据
-                    if local_count > 0:
-                        self._flush_batch_buffer(local_buffer)
-                    logger.info(f"[{self.recording_uuid}] Async Sender #{thread_id} Stopped")
-
-            # 启动线程
-            threading.Thread(target=seq_sender_loop, daemon=True).start()
-            
-            for i in range(SENDER_THREAD_COUNT):
-                threading.Thread(target=async_sender_loop, args=(i,), daemon=True).start()
+            # 消费者线程现在已经由 _start_sender_threads 在初始化时启动，
+            # 所以这里不需要再定义和启动 sender loops 了。
 
             # --- C. 推送历史数据 (Producer) ---
             logger.info(f"[{self.recording_uuid}] 开始全速流水线加载...")

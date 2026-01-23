@@ -34,13 +34,30 @@ async def create_source(config: CreateSourceConfig):
     """创建 Rerun 会话"""
     try:
         session = manager.create_session(config.dataset, config.collection)
+        
+        # 如果配置要求开启对齐模式
+        if config.alignment_mode:
+            session.set_alignment_mode(True)
+            
         connect_url = f"rerun+http://{BACKEND_IP}:{session.port}/proxy"
+        
+        # 尝试获取最大帧索引 (这需要 DataManager 支持，或者我们在 session 初始化时预读了)
+        # 暂时使用 session.max_frame_idx，如果 session 还没有数据，可能需要 DataManager 查一下
+        # 这里假设 session 初始化时已经大概知道了，或者我们直接查 DataManager
+        from ..core import DataManager
+        try:
+            # 这是一个简单的 count 操作，应该很快
+            max_idx = DataManager.get_collection_count(config.dataset, config.collection)
+        except:
+            max_idx = 0
+
         return SourceResponse(
             status="created",
             app_id=session.app_id,
             recording_uuid=session.recording_uuid,
             port=session.port,
-            connect_url=connect_url
+            connect_url=connect_url,
+            max_frame_idx=max_idx
         )
     except Exception as e:
         logger.error(f"Create session error: {e}")
@@ -93,6 +110,31 @@ async def heartbeat(recording_uuid: str):
         "status": "alive",
         "recording_uuid": recording_uuid,
         "server_time": time.time()
+    }
+
+@router.get("/get_info/{recording_uuid}")
+async def get_info(recording_uuid: str):
+    """获取 Session 详细信息，包括最大帧数"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    # 获取最大帧数
+    from ..core import DataManager
+    try:
+        max_idx = DataManager.get_collection_count(session.dataset, session.collection)
+    except:
+        max_idx = 0
+        
+    return {
+        "recording_uuid": recording_uuid,
+        "app_id": session.app_id,
+        "dataset": session.dataset,
+        "collection": session.collection,
+        "max_frame_idx": max_idx
     }
 
 @router.post("/refresh_ui/{recording_uuid}")
