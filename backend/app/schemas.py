@@ -42,3 +42,7 @@ class RateSourceConfig(BaseModel):
     source_name: str
     score: str
     comment: str = Field(None, description="备注信息")
+
+class LoadRangeConfig(BaseModel):
+    start_index: int
+    end_index: int

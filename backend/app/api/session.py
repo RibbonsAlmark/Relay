@@ -1,12 +1,33 @@
 import time
 from fastapi import APIRouter, HTTPException
-from ..schemas import CreateSourceConfig, SourceResponse
+from ..schemas import CreateSourceConfig, SourceResponse, LoadRangeConfig
 from ..core import manager
 from ..config import BACKEND_IP
 from ..service import session_service
 from loguru import logger
 
 router = APIRouter()
+
+@router.post("/load_range/{recording_uuid}")
+async def load_range(recording_uuid: str, config: LoadRangeConfig):
+    """加载指定范围的数据（支持重载或初次加载）"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    try:
+        session.load_range(config.start_index, config.end_index)
+        return {
+            "status": "loading", 
+            "range": [config.start_index, config.end_index],
+            "recording_uuid": recording_uuid
+        }
+    except Exception as e:
+        logger.error(f"Load range API error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/create_source", response_model=SourceResponse)
 async def create_source(config: CreateSourceConfig):

@@ -1,5 +1,5 @@
 import datetime
-from typing import Any, Dict, Generator
+from typing import Any, Dict, Generator, Optional, List, Tuple, Union
 from dp_data_common.client.data_client import DataClient
 from loguru import logger
 from .logic.tagger import TaggerLogic
@@ -65,16 +65,79 @@ class DataManager:
         return result
 
     @staticmethod
-    def fetch_frames_iter(database: str, collection: str) -> Generator[Dict, None, None]:
-        """全量迭代器"""
+    def fetch_frames(
+        database: str, 
+        collection: str,
+        query: Optional[Dict] = None,
+        projection: Optional[Union[List[str], Dict[str, bool]]] = None,
+        sort: Optional[List[Tuple[str, int]]] = None,
+        skip: Optional[int] = None,
+        limit: Optional[int] = None,
+        sample_step: Optional[int] = None,
+    ) -> Generator[Dict, None, None]:
+        """
+        通用数据获取接口，支持 DataClient.find 的所有查询参数。
+        强制使用流式返回 (stream=True) 并自动清洗数据 (_clean_doc)。
+
+        Args:
+            database (str): 数据库名称
+            collection (str): 集合名称
+            query (Optional[Dict]): 查询条件 (MongoDB 语法), e.g. {"tag.score": "good"}
+            projection (Optional[Union[List[str], Dict[str, bool]]]): 字段投影, e.g. {"image": 0} 或 ["timestamp", "pose"]
+            sort (Optional[List[Tuple[str, int]]]): 排序规则, e.g. [("timestamp", 1)]
+            skip (Optional[int]): 跳过前 N 条数据
+            limit (Optional[int]): 限制返回的数据条数
+            sample_step (Optional[int]): 采样步长 (每 N 条取 1 条)
+
+        Returns:
+            Generator[Dict, None, None]: 清洗后的数据生成器
+
+        Usage:
+            # 1. 基础全量
+            frames = DataManager.fetch_frames("db", "col")
+            
+            # 2. 复杂查询 (筛选 + 排序 + 分页)
+            frames = DataManager.fetch_frames(
+                "db", "col",
+                query={"meta.valid": True},
+                sort=[("meta.create_time", -1)],
+                skip=100,
+                limit=50
+            )
+            
+            # 3. 字段过滤 (只取 timestamp)
+            frames = DataManager.fetch_frames("db", "col", projection=["timestamp"])
+        """
         client = DataManager.get_client()
         try:
-            # limit=None 开启全量获取
-            cursor = client.find(database=database, collection=collection, limit=None)
+            cursor = client.find(
+                database=database,
+                collection=collection,
+                query=query,
+                projection=projection,
+                sort=sort,
+                skip=skip,
+                limit=limit,
+                sample_step=sample_step,
+                stream=True
+            )
             for doc in cursor:
                 yield DataManager._clean_doc(doc)
         except Exception as e:
-            print(f"Database Error: {e}")
+            logger.error(f"Database Fetch Error: {e}")
+
+    @staticmethod
+    def fetch_frames_iter(database: str, collection: str) -> Generator[Dict, None, None]:
+        """全量迭代器 (Wrapper around fetch_frames)"""
+        yield from DataManager.fetch_frames(database, collection)
+
+    @staticmethod
+    def fetch_frames_range(database: str, collection: str, start: int, end: int) -> Generator[Dict, None, None]:
+        """获取指定范围的数据 (Wrapper around fetch_frames)"""
+        limit = end - start
+        if limit <= 0:
+            return
+        yield from DataManager.fetch_frames(database, collection, skip=start, limit=limit)
 
     @staticmethod
     def _clean_doc(doc: Any) -> Any:

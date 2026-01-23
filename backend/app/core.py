@@ -296,6 +296,44 @@ class RerunSession:
             logger.error(f"[{self.recording_uuid}] 异步任务提交失败: {e}")
             return False
 
+    def load_range(self, start_idx: int, end_idx: int):
+        """
+        加载指定范围的数据并发送（支持重载或初次加载）
+        :param start_idx: 起始索引 (包含)
+        :param end_idx: 结束索引 (不包含)
+        """
+        if self.is_dead:
+            return
+
+        logger.info(f"[{self.recording_uuid}] Loading range [{start_idx}, {end_idx})...")
+        
+        try:
+            # 直接调用 DataManager 封装好的方法获取数据
+            new_frames = list(DataManager.fetch_frames_range(
+                self.dataset, 
+                self.collection, 
+                start=start_idx, 
+                end=end_idx
+            ))
+            
+            if not new_frames:
+                logger.warning(f"[{self.recording_uuid}] No data found for range [{start_idx}, {end_idx})")
+                return
+
+            # 更新本地缓存
+            if self._frames_iter_cache is not None:
+                cache_len = len(self._frames_iter_cache)
+                update_limit = min(len(new_frames), cache_len - start_idx)
+                if update_limit > 0:
+                    self._frames_iter_cache[start_idx : start_idx + update_limit] = new_frames[:update_limit]
+
+            # 推送数据
+            self.push_frames(new_frames, start_idx=start_idx)
+            logger.info(f"[{self.recording_uuid}] Loaded and pushed {len(new_frames)} frames.")
+
+        except Exception as e:
+            logger.error(f"[{self.recording_uuid}] Load range failed: {e}")
+
     def _seq_task_handler(self, frame_data, idx):
         """这个函数由于在 max_workers=1 的线程池运行，天然具备顺序性"""
         if self.is_dead or self.stop_signal.is_set(): return
