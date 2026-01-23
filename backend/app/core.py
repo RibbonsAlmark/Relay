@@ -112,6 +112,19 @@ class RerunSession:
                 # 必须将其转为 list 才能多次使用。
                 cursor = DataManager.fetch_frames_iter(dataset, collection)
                 self._frames_iter_cache = list(cursor)
+
+                # 发送哨兵数据以强制撑开时间轴
+                if self._frames_iter_cache:
+                    start_f = 0
+                    end_f = len(self._frames_iter_cache)
+                    
+                    # 注意：必须是 非静态 (static=False) 数据才能撑开时间轴。
+                    self.stream.set_time("frame_idx", sequence=start_f)
+                    self.stream.log("internal/range_marker", rr.TextLog("Start"))
+                    
+                    self.stream.set_time("frame_idx", sequence=end_f)
+                    self.stream.log("internal/range_marker", rr.TextLog("End"))
+
             except Exception as e:
                 logger.error(f"[{self.recording_uuid}] Frames Iter Init Failed: {e}")
                 self._frames_iter_cache = []

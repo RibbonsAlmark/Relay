@@ -65,6 +65,20 @@ class DataManager:
         return result
 
     @staticmethod
+    def get_frame_range(database: str, collection: str) -> Tuple[int, int]:
+        """
+        获取数据集的帧范围 (Start, End)
+        目前逻辑简化为：Start=0, End=TotalCount
+        """
+        client = DataManager.get_client()
+        try:
+            total_count = client.count(database, collection)
+            return 0, total_count
+        except Exception as e:
+            logger.error(f"Failed to get frame range: {e}")
+            return 0, 1000 # Fallback
+
+    @staticmethod
     def fetch_frames(
         database: str, 
         collection: str,
