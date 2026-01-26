@@ -15,11 +15,3 @@ class MetaProcessor(BaseProcessor):
         # 1. 处理当前帧的完整 JSON
         doc_json = json.dumps(doc, ensure_ascii=False)
         yield "meta/frame_info", rr.AnyValues(raw_json=doc_json)
-
-        # 2. 获取并处理数据源目录 (source_catalog)
-        # 建议从 kwargs 安全获取
-        source_catalog = kwargs.get("source_catalog")
-        
-        if source_catalog is not None:
-            catalog_json = json.dumps(source_catalog, ensure_ascii=False)
-            yield "meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"),

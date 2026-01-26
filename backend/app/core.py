@@ -2,6 +2,7 @@ import rerun as rr
 import uuid
 import time
 import threading
+import json
 import queue
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -87,6 +88,28 @@ class RerunSession:
         self._source_catalog_cache = []
         self._source_catalog_event = threading.Event()
         
+        # 2. Frames Iter 独立线程初始化 (Background Cache)
+        self._frames_iter_cache = None
+        self._frames_iter_event = threading.Event()
+
+        def _init_frames_iter():
+            try:
+                t0 = time.time()
+                logger.debug(f"[{self.recording_uuid}] 开始后台加载 Frames Cache...")
+                cursor = DataManager.fetch_frames_iter(dataset, collection)
+                # 全量加载到内存
+                self._frames_iter_cache = list(cursor)
+                t1 = time.time()
+                logger.success(f"[{self.recording_uuid}] Frames Cache 加载完成，共 {len(self._frames_iter_cache)} 帧，耗时 {t1 - t0:.2f}s")
+            except Exception as e:
+                logger.error(f"[{self.recording_uuid}] Frames Cache Init Failed: {e}")
+                self._frames_iter_cache = [] # 失败则置为空列表防崩
+            finally:
+                self._frames_iter_event.set()
+        
+        # 启动后台加载线程
+        threading.Thread(target=_init_frames_iter, daemon=True).start()
+        
         def _init_source_catalog():
             try:
                 t0 = time.time()
@@ -100,6 +123,13 @@ class RerunSession:
                 self._source_catalog_cache = result
                 t1 = time.time()
                 logger.debug(f"[{self.recording_uuid}] Source Catalog 初始化完成，耗时 {t1 - t0:.2f}s")
+                
+                # Log source_catalog to frame 0 immediately
+                if result:
+                    catalog_json = json.dumps(result, ensure_ascii=False)
+                    self.stream.set_time("frame_idx", sequence=0)
+                    self.stream.log("meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"))
+                    
             except Exception as e:
                 logger.error(f"[{self.recording_uuid}] Source Catalog Init Failed: {e}")
             finally:
@@ -249,8 +279,13 @@ class RerunSession:
 
     @property
     def frames_iter(self):
-        """获取新的数据流迭代器 (Generator)"""
-        return DataManager.fetch_frames_iter(self.dataset, self.collection)
+        """获取数据流迭代器：优先使用内存缓存，未就绪则直连 DB"""
+        if self._frames_iter_cache is not None:
+            # 缓存已就绪，返回迭代器
+            return iter(self._frames_iter_cache)
+        else:
+            # 缓存未就绪，直接查询 DB (Fallback)
+            return DataManager.fetch_frames_iter(self.dataset, self.collection)
 
     @property
     def source_catalog(self):
@@ -433,7 +468,6 @@ class RerunSession:
                     frame_data, idx, 
                     src_db=self.dataset, src_col=self.collection,
                     recording_uuid=self.recording_uuid,
-                    source_catalog=self.source_catalog,
                 )
                 # 阻塞入队：实现背压的核心
                 # 优先级 10 (低)
@@ -470,13 +504,36 @@ class RerunSession:
     def load_range(self, start_idx: int, end_idx: int):
         """
         加载指定范围的数据并发送（支持重载或初次加载）
-        引入 LRU 缓存机制，针对滑动窗口请求仅拉取增量数据。
+        Hybrid Mode: 如果全量缓存已就绪，直接从内存切片；否则走 LRU + DB 增量拉取。
         """
         t0 = time.time()
         if self.is_dead:
             return
 
-        logger.info(f"[{self.recording_uuid}] Loading range [{start_idx}, {end_idx})...")
+        # --- A. 快速路径：全量缓存已就绪 ---
+        if self._frames_iter_cache is not None:
+            try:
+                # 直接内存切片，速度极快
+                # 注意范围越界处理
+                safe_end = min(end_idx, len(self._frames_iter_cache))
+                safe_start = min(start_idx, safe_end)
+                
+                final_frames = self._frames_iter_cache[safe_start:safe_end]
+                
+                if not final_frames:
+                    logger.warning(f"[{self.recording_uuid}] [Cache] No data found for range [{start_idx}, {end_idx})")
+                    return
+
+                # 推送数据
+                self.push_frames(final_frames, start_idx=start_idx)
+                logger.debug(f"[{self.recording_uuid}] [Cache] load_range hit memory cache, cost {time.time() - t0:.3f}s")
+                return
+            except Exception as e:
+                logger.error(f"[{self.recording_uuid}] [Cache] load_range failed: {e}")
+                return
+
+        # --- B. 慢速路径：流式 + LRU 缓存 ---
+        logger.info(f"[{self.recording_uuid}] [Streaming] Loading range [{start_idx}, {end_idx})...")
         
         try:
             fetch_start = time.time()
@@ -546,7 +603,6 @@ class RerunSession:
                 src_db=self.dataset, 
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
-                source_catalog=self.source_catalog,
                 streaming_mode=self.streaming_mode
             )
             
@@ -576,7 +632,6 @@ class RerunSession:
                 src_db=self.dataset, 
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
-                source_catalog=self.source_catalog,
                 streaming_mode=self.streaming_mode
             )
             
@@ -700,7 +755,6 @@ class RerunSession:
                     src_db=self.dataset, 
                     src_col=self.collection,
                     recording_uuid=self.recording_uuid,
-                    source_catalog=self.source_catalog,
                     streaming_mode=self.streaming_mode
                 )
                 self._enqueue_async(prio, idx, payload)
