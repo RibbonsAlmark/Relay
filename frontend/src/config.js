@@ -9,6 +9,9 @@ export const API_ENDPOINTS = {
   HEARTBEAT: (uuid) => `${BASE_URL}/heartbeat/${uuid}`, 
   LOAD_RANGE: (uuid) => `${BASE_URL}/load_range/${uuid}`,
   GET_INFO: (uuid) => `${BASE_URL}/get_info/${uuid}`,
+  ENABLE_STREAMING: (uuid) => `${BASE_URL}/enable_streaming_mode/${uuid}`,
+  ENABLE_ALIGNMENT: (uuid) => `${BASE_URL}/enable_alignment_mode/${uuid}`,
+  REFRESH_UI: (uuid) => `${BASE_URL}/refresh_ui/${uuid}`,
 };
 
 export const RERUN_CONFIG = {
@@ -17,5 +20,5 @@ export const RERUN_CONFIG = {
   STREAMING_BATCH_SIZE: 100, // 默认流式加载批次大小
   STREAMING_BUFFER_THRESHOLD: 50, // 流式加载触发阈值
   STREAMING_MAX_CACHED_FRAMES: 1000, // 最大缓存帧数
-  STREAMING_DROP_CHUNK_SIZE: 100, // 每次清理的帧数
+  STREAMING_KEEP_WINDOW_RATIO: 2.0, // 保留窗口系数 (Window Size = Batch Size * Ratio)
 };

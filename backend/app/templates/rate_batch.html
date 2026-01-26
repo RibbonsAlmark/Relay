@@ -17,4 +17,28 @@
             <span style="color: #2980b9; font-weight: bold;">{{ processed_count }}</span>
         </p>
     </div>
+    <script>
+        (function() {
+            try {
+                const targets = [];
+                if (window.opener) {
+                    targets.push(window.opener);
+                    try {
+                        if (window.opener.top && window.opener.top !== window.opener) {
+                            targets.push(window.opener.top);
+                        }
+                    } catch (e) {}
+                }
+                
+                if (targets.length > 0) {
+                    targets.forEach(t => {
+                        t.postMessage({
+                            type: "RERUN_RATING_COMPLETE",
+                            recording_uuid: "{{ recording_uuid }}"
+                        }, "*");
+                    });
+                }
+            } catch (e) {}
+        })();
+    </script>
 {% endblock %}

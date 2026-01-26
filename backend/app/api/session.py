@@ -5,6 +5,7 @@ from ..core import manager
 from ..config import BACKEND_IP
 from ..service import session_service
 from loguru import logger
+from ..schemas import RefreshUIRequest
 
 router = APIRouter()
 
@@ -17,6 +18,9 @@ async def load_range(recording_uuid: str, config: LoadRangeConfig):
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    
+    # 只要调用了流式加载接口，就标记该 Session 为流式模式
+    session.streaming_mode = True
     
     try:
         session.load_range(config.start_index, config.end_index)
@@ -38,6 +42,11 @@ async def create_source(config: CreateSourceConfig):
         # 如果配置要求开启对齐模式
         if config.alignment_mode:
             session.set_alignment_mode(True)
+            print(f"Alignment mode enabled for session {session.recording_uuid}")
+            
+        if config.streaming_mode:
+            session.streaming_mode = True
+            print(f"Streaming mode enabled for session {session.recording_uuid}")
             
         connect_url = f"rerun+http://{BACKEND_IP}:{session.port}/proxy"
         
@@ -62,6 +71,32 @@ async def create_source(config: CreateSourceConfig):
     except Exception as e:
         logger.error(f"Create session error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create Rerun session: {str(e)}")
+
+@router.post("/enable_streaming_mode/{recording_uuid}")
+async def enable_streaming_mode(recording_uuid: str):
+    """显式开启流式模式"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    session.streaming_mode = True
+    return {"status": "success", "recording_uuid": recording_uuid, "streaming_mode": True}
+
+@router.post("/enable_alignment_mode/{recording_uuid}")
+async def enable_alignment_mode(recording_uuid: str):
+    """显式开启对齐模式"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    session.set_alignment_mode(True)
+    return {"status": "success", "recording_uuid": recording_uuid, "alignment_mode": True}
 
 @router.post("/play_data/{recording_uuid}")
 async def play_data(recording_uuid: str):
@@ -137,12 +172,18 @@ async def get_info(recording_uuid: str):
         "max_frame_idx": max_idx
     }
 
+
+
 @router.post("/refresh_ui/{recording_uuid}")
-async def refresh_ui(recording_uuid: str):
+async def refresh_ui(recording_uuid: str, req: RefreshUIRequest):
     """
-    单独触发 UI 组件的刷新（不重新加载点云和图像）
+    单独触发 UI 组件的刷新（不重新加载点云和图像）。
+    可选参数 loaded_ranges: 指定只刷新的帧区间 [[start, end], ...]
     """
-    success = session_service.trigger_ui_refresh(recording_uuid)
+    # 优先使用 path 参数里的 uuid，其次是请求体中的 uuid
+    recording_uuid = req.recording_uuid or recording_uuid
+
+    success = session_service.trigger_ui_refresh(recording_uuid, loaded_ranges=req.loaded_ranges)
     if not success:
         raise HTTPException(
             status_code=404, 
@@ -152,5 +193,6 @@ async def refresh_ui(recording_uuid: str):
     return {
         "status": "ui_refresh_triggered",
         "recording_uuid": recording_uuid,
+        "ranges": req.loaded_ranges,
         "timestamp": time.time()
     }

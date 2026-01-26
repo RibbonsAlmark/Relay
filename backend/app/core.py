@@ -3,9 +3,12 @@ import uuid
 import time
 import threading
 import queue
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from app.metadata_utils import get_global_sources
-from typing import Dict
+from typing import Dict, List
+from itertools import groupby
+from operator import itemgetter
 from loguru import logger
 import psutil
 import os
@@ -13,7 +16,7 @@ import os
 from .data_provider import DataManager
 from .rerun_logger import RerunLogger
 from .port_manager import PortManager
-from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER, SENDER_THREAD_COUNT, BATCH_BUFFER_SIZE_LIMIT, BATCH_BUFFER_TIMEOUT
+from app.config import WORKER_THREAD_MULTIPLIER, BACKPRESSURE_QUEUE_MULTIPLIER, SENDER_THREAD_COUNT, BATCH_BUFFER_SIZE_LIMIT, BATCH_BUFFER_TIMEOUT, SLIDING_WINDOW_CACHE_SIZE
 from app.utils import estimate_payload_size
 
 class RerunSession:
@@ -56,6 +59,7 @@ class RerunSession:
         self.log_queue_counter = 0  # 用于解决 PriorityQueue 优先级相同时的排序冲突
         self.queue_lock = threading.Lock() # 保护 counter 的线程安全
         self.max_frame_idx = 0 
+        self.streaming_mode = False # 是否处于流式模式
         
         self.created_at = time.time()
         self.last_heartbeat = time.time()
@@ -83,64 +87,39 @@ class RerunSession:
         self._source_catalog_cache = []
         self._source_catalog_event = threading.Event()
         
-        # 2. Frames Iter 独立线程初始化 (Lazy Loading)
-        self._frames_iter_cache = None
-        self._frames_iter_event = threading.Event()
-
         def _init_source_catalog():
             try:
-                # 等待 frames_iter 加载完成，复用它
-                self._frames_iter_event.wait()
-                frames_iter = self._frames_iter_cache
+                t0 = time.time()
+                logger.debug(f"[{self.recording_uuid}] 开始初始化 Source Catalog (Aggregation)...")
                 
-                # 注意：get_global_sources 需要能够处理迭代器复用，或者我们这里只传部分参数
-                # 但根据用户要求，get_global_sources 不允许内部再查一次
-                # 修改 metadata_utils.get_global_sources 使其支持直接传入 frames_iter (需要修改函数签名)
-                # 这里暂时假设我们修改 get_global_sources 的实现
+                # 使用 Aggregation 直接从 DB 获取，无需遍历所有帧
                 result = get_global_sources(
                     dataset=dataset,
-                    collection=collection,
-                    start_index=0,
-                    max_workers=8,
-                    existing_iter=frames_iter # 假设新增参数
+                    collection=collection
                 )
                 self._source_catalog_cache = result
+                t1 = time.time()
+                logger.debug(f"[{self.recording_uuid}] Source Catalog 初始化完成，耗时 {t1 - t0:.2f}s")
             except Exception as e:
                 logger.error(f"[{self.recording_uuid}] Source Catalog Init Failed: {e}")
             finally:
                 self._source_catalog_event.set()
 
-        def _init_frames_iter():
-            try:
-                # 预加载所有帧 (List[Dict]) 以便复用
-                # 注意：如果数据量巨大，list() 可能会爆内存。但用户要求复用，意味着必须缓存。
-                # DataManager.fetch_frames_iter 返回的是 cursor，只能遍历一次。
-                # 必须将其转为 list 才能多次使用。
-                cursor = DataManager.fetch_frames_iter(dataset, collection)
-                self._frames_iter_cache = list(cursor)
+        threading.Thread(target=_init_source_catalog, daemon=True).start()
 
-                # 发送哨兵数据以强制撑开时间轴
-                if self._frames_iter_cache:
-                    start_f = 0
-                    end_f = len(self._frames_iter_cache)
-                    
-                    # 注意：必须是 非静态 (static=False) 数据才能撑开时间轴。
-                    self.stream.set_time("frame_idx", sequence=start_f)
-                    self.stream.log("internal/range_marker", rr.TextLog("Start"))
-                    
-                    self.stream.set_time("frame_idx", sequence=end_f)
-                    self.stream.log("internal/range_marker", rr.TextLog("End"))
+        # 2. 时间轴初始化 (Range Markers)
+        # 不再预加载所有帧，仅查询总数以设定时间轴范围
+        try:
+            total_count = DataManager.get_collection_count(dataset, collection)
+            if total_count > 0:
+                self.stream.set_time("frame_idx", sequence=0)
+                self.stream.log("internal/range_marker", rr.TextLog("Start"))
+                self.stream.set_time("frame_idx", sequence=total_count - 1)
+                self.stream.log("internal/range_marker", rr.TextLog("End"))
+                self.max_frame_idx = total_count
+        except Exception as e:
+            logger.error(f"Failed to set range markers: {e}")
 
-            except Exception as e:
-                logger.error(f"[{self.recording_uuid}] Frames Iter Init Failed: {e}")
-                self._frames_iter_cache = []
-            finally:
-                self._frames_iter_event.set()
-                # frames_iter 准备好后，触发 source_catalog 初始化
-                threading.Thread(target=_init_source_catalog, daemon=True).start()
-
-        # 启动 Frames Iter 加载线程
-        threading.Thread(target=_init_frames_iter, daemon=True).start()
 
         # 2. 顺序任务重组缓冲区 (Reordering Buffer)
         # 不再使用单线程池，而是通过缓冲区实现并发计算 + 顺序提交
@@ -148,6 +127,11 @@ class RerunSession:
         self.seq_buffer = []  # Heapq: (idx, prio, payload)
         self.seq_lock = threading.Lock()
         
+        # --- 3. 滑动窗口缓存 (Sliding Window Cache) ---
+        # 用于优化 load_range 的连续请求，避免重复查询数据库
+        self._recent_frames_cache = OrderedDict()
+        self._recent_frames_limit = SLIDING_WINDOW_CACHE_SIZE  # 缓存最近访问的帧 (默认 300)
+
         # --- 启动消费者线程 (Senders) ---
         # 无论是否处于“播放”状态，消费者线程都必须常驻，以处理 load_range 等按需请求
         self._start_sender_threads()
@@ -265,9 +249,8 @@ class RerunSession:
 
     @property
     def frames_iter(self):
-        """懒加载获取 frames_iter (List)，如果未完成则阻塞等待"""
-        self._frames_iter_event.wait()
-        return self._frames_iter_cache
+        """获取新的数据流迭代器 (Generator)"""
+        return DataManager.fetch_frames_iter(self.dataset, self.collection)
 
     @property
     def source_catalog(self):
@@ -420,6 +403,7 @@ class RerunSession:
         Returns:
             bool: 推送任务是否成功进入管道。
         """
+        t0 = time.time()
         if self.is_dead:
             logger.warning(f"[{self.recording_uuid}] 尝试向已销毁的 Session 推送数据")
             return False
@@ -462,6 +446,7 @@ class RerunSession:
         try:
             # 获取当前模式快照，确保同一帧的任务处理逻辑一致
             use_alignment = self.alignment_mode
+            submit_start = time.time()
 
             for i, frame_data in enumerate(frames):
                 idx = base_idx + i
@@ -474,6 +459,9 @@ class RerunSession:
                 # 依然由多线程池全速计算图像
                 self.process_executor.submit(self._async_task_handler, frame_data, idx, use_alignment)
             
+            submit_end = time.time()
+            if len(frames) > 100: # 仅在批量较大时打印
+                 logger.debug(f"[{self.recording_uuid}] push_frames 提交 {len(frames)} 帧耗时: {submit_end - submit_start:.3f}s (Total overhead: {submit_end - t0:.3f}s)")
             return True
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] 异步任务提交失败: {e}")
@@ -482,37 +470,68 @@ class RerunSession:
     def load_range(self, start_idx: int, end_idx: int):
         """
         加载指定范围的数据并发送（支持重载或初次加载）
-        :param start_idx: 起始索引 (包含)
-        :param end_idx: 结束索引 (不包含)
+        引入 LRU 缓存机制，针对滑动窗口请求仅拉取增量数据。
         """
+        t0 = time.time()
         if self.is_dead:
             return
 
         logger.info(f"[{self.recording_uuid}] Loading range [{start_idx}, {end_idx})...")
         
         try:
-            # 直接调用 DataManager 封装好的方法获取数据
-            new_frames = list(DataManager.fetch_frames_range(
-                self.dataset, 
-                self.collection, 
-                start=start_idx, 
-                end=end_idx
-            ))
+            fetch_start = time.time()
             
-            if not new_frames:
+            # --- 1. 计算缺失区间 ---
+            needed_indices = range(start_idx, end_idx)
+            missing_indices = [idx for idx in needed_indices if idx not in self._recent_frames_cache]
+            
+            # --- 2. 增量拉取缺失数据 ---
+            if missing_indices:
+                # 将离散的缺失索引合并为连续区间，减少 DB 查询次数
+                # e.g. [100, 101, 105, 106] -> [(100, 102), (105, 107)]
+                ranges_to_fetch = []
+                for k, g in groupby(enumerate(missing_indices), lambda ix: ix[0] - ix[1]):
+                    group = list(map(itemgetter(1), g))
+                    ranges_to_fetch.append((group[0], group[-1] + 1))
+                
+                logger.debug(f"[{self.recording_uuid}] Cache miss: {len(missing_indices)} frames. Fetching {len(ranges_to_fetch)} chunks...")
+                
+                for r_start, r_end in ranges_to_fetch:
+                    new_chunk = list(DataManager.fetch_frames_range(
+                        self.dataset, 
+                        self.collection, 
+                        start=r_start, 
+                        end=r_end
+                    ))
+                    # 更新缓存
+                    for i, frame in enumerate(new_chunk):
+                        self._recent_frames_cache[r_start + i] = frame
+            
+            fetch_end = time.time()
+            
+            # --- 3. 组装完整数据 & 维护 LRU ---
+            final_frames = []
+            for idx in needed_indices:
+                if idx in self._recent_frames_cache:
+                    frame = self._recent_frames_cache[idx]
+                    final_frames.append(frame)
+                    # LRU: 标记为最近使用 (移到末尾)
+                    self._recent_frames_cache.move_to_end(idx)
+            
+            # --- 4. 清理溢出缓存 ---
+            while len(self._recent_frames_cache) > self._recent_frames_limit:
+                self._recent_frames_cache.popitem(last=False) # 移除最旧的 (FIFO/LRU)
+
+            if not final_frames:
                 logger.warning(f"[{self.recording_uuid}] No data found for range [{start_idx}, {end_idx})")
                 return
 
-            # 更新本地缓存
-            if self._frames_iter_cache is not None:
-                cache_len = len(self._frames_iter_cache)
-                update_limit = min(len(new_frames), cache_len - start_idx)
-                if update_limit > 0:
-                    self._frames_iter_cache[start_idx : start_idx + update_limit] = new_frames[:update_limit]
-
             # 推送数据
-            self.push_frames(new_frames, start_idx=start_idx)
-            logger.info(f"[{self.recording_uuid}] Loaded and pushed {len(new_frames)} frames.")
+            push_start = time.time()
+            self.push_frames(final_frames, start_idx=start_idx)
+            push_end = time.time()
+            
+            logger.debug(f"[{self.recording_uuid}] load_range 完成，总耗时 {time.time() - t0:.3f}s (Fetch: {fetch_end - fetch_start:.3f}s, Push: {push_end - push_start:.3f}s, Cache Hit: {len(needed_indices) - len(missing_indices)}/{len(needed_indices)})")
 
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] Load range failed: {e}")
@@ -528,7 +547,7 @@ class RerunSession:
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
                 source_catalog=self.source_catalog,
-
+                streaming_mode=self.streaming_mode
             )
             
             if use_alignment:
@@ -548,6 +567,9 @@ class RerunSession:
         """在多线程池运行，处理图像等耗时项"""
         if self.is_dead or self.stop_signal.is_set(): return
         try:
+            if not self.recording_uuid:
+                logger.error(f"RerunSession: recording_uuid is empty at frame {idx}!")
+
             # 只提取异步数据 (Image 等)
             prio, payload = RerunLogger.compute_async_payload(
                 frame_data, idx, 
@@ -555,6 +577,7 @@ class RerunSession:
                 src_col=self.collection,
                 recording_uuid=self.recording_uuid,
                 source_catalog=self.source_catalog,
+                streaming_mode=self.streaming_mode
             )
             
             if use_alignment:
@@ -625,14 +648,14 @@ class RerunSession:
             # 所以这里不需要再定义和启动 sender loops 了。
 
             # --- C. 推送历史数据 (Producer) ---
-            logger.info(f"[{self.recording_uuid}] 开始全速流水线加载...")
-            # 复用已缓存的 frames_iter
-            frames_list = self.frames_iter
+            logger.info(f"[{self.recording_uuid}] 开始全速流水线加载 (Streaming)...")
+            # 使用流式 Cursor
+            frames_cursor = self.frames_iter
             
             batch = []
-            batch_size = 15 # 增大 Batch，喂饱线程池
+            batch_size = 15
             
-            for i, doc in enumerate(frames_list):
+            for i, doc in enumerate(frames_cursor):
                 if self.stop_signal.is_set() or self.is_dead: 
                     logger.info(f"[{self.recording_uuid}] 检测到 Session 销毁，停止读取数据")
                     break
@@ -660,49 +683,60 @@ class RerunSession:
             with self.play_lock:
                 self.is_playing = False
 
-    def _execute_recompute_pipeline(self, target_processors: list, label: str):
+    def _execute_recompute_pipeline(self, target_processors: list, label: str, ranges: list = None):
         if self.is_dead: return
         
-        logger.info(f"[{self.recording_uuid}] 启动异步重计算: {label}")
-
-        try:
-            # 重新获取最新数据
-            cursor = DataManager.fetch_frames_iter(
-                self.dataset, 
-                self.collection
-            )
-            # 更新缓存
-            new_frames = list(cursor)
-            self._frames_iter_cache = new_frames
-            # 确保事件已设置 (理论上应该是 set 状态，但为了保险)
-            self._frames_iter_event.set() 
-        except Exception as e:
-             logger.error(f"[{label}] Re-fetch frames failed: {e}")
-             return
+        range_info = f"范围: {ranges}" if ranges else "全量"
+        logger.info(f"[{self.recording_uuid}] 启动异步重计算: {label}, {range_info}")
 
         def _task(frame_data, idx):
-            if self.is_dead or self.stop_signal.is_set(): return
+            if self.is_dead or self.stop_signal.is_set(): 
+                return
             try:
-                # 【关键修复】确保显式传入 frame_idx 参数
                 prio, payload = RerunLogger.compute_async_payload(
-                    doc=frame_data,        # 对应 doc
-                    frame_idx=idx,         # 对应 frame_idx (之前可能写成了 idx 或者漏传了)
+                    doc=frame_data,
+                    frame_idx=idx,
                     target_processors=target_processors,
                     src_db=self.dataset, 
                     src_col=self.collection,
                     recording_uuid=self.recording_uuid,
                     source_catalog=self.source_catalog,
+                    streaming_mode=self.streaming_mode
                 )
-                
-                # 检查是否需要启动发送者线程（如果当前没有在播放，需要有一个人消费队列）
-                # 使用动态优先级
                 self._enqueue_async(prio, idx, payload)
             except Exception as e:
                 logger.error(f"[{label}] 帧 {idx} 任务失败: {e}")
 
-        for i, doc in enumerate(self.frames_iter):
-            if self.stop_signal.is_set(): break
-            self.process_executor.submit(_task, doc, i)
+        # 根据 ranges 决定处理哪些帧
+        submitted_tasks = 0
+        submit_start = time.time()
+
+        if ranges:
+            for start, end in ranges:
+                # 越界保护
+                safe_start = max(0, int(start))
+                # 使用 fetch_frames_range 获取游标
+                cursor = DataManager.fetch_frames_range(self.dataset, self.collection, safe_start, int(end))
+                
+                for i, doc in enumerate(cursor):
+                    if self.stop_signal.is_set(): break
+                    real_idx = safe_start + i
+                    self.process_executor.submit(_task, doc, real_idx)
+                    submitted_tasks += 1
+                    if submitted_tasks % 100 == 0:
+                        logger.debug(f"[{label}] 已提交任务: {submitted_tasks}")
+        else:
+            # 全量处理 - 使用流式迭代器
+            cursor = self.frames_iter
+            for i, doc in enumerate(cursor):
+                if self.stop_signal.is_set(): break
+                self.process_executor.submit(_task, doc, i)
+                submitted_tasks += 1
+                if submitted_tasks % 500 == 0:
+                     logger.debug(f"[{label}] 已提交任务: {submitted_tasks}")
+        
+        submit_end = time.time()
+        logger.success(f"[{self.recording_uuid}] [{label}] 异步重计算任务提交完成，共提交 {submitted_tasks} 个任务，耗时 {submit_end - submit_start:.3f}s")
     
     def cleanup(self):
         if self.is_dead: 

@@ -5,6 +5,7 @@ class CreateSourceConfig(BaseModel):
     dataset: str
     collection: str
     alignment_mode: Optional[bool] = False # 是否开启对齐模式 (保证同一帧的数据打包发送)
+    streaming_mode: Optional[bool] = False # 是否开启流式加载模式
 
 class SourceResponse(BaseModel):
     status: str
@@ -48,3 +49,7 @@ class RateSourceConfig(BaseModel):
 class LoadRangeConfig(BaseModel):
     start_index: int
     end_index: int
+
+class RefreshUIRequest(BaseModel):
+    recording_uuid: Optional[str] = None
+    loaded_ranges: Optional[list] = None # 可选参数：指定只刷新的帧区间 [[start, end], ...]

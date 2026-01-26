@@ -33,3 +33,10 @@ DEPTH_IMG_COMPRESS = os.getenv("DEPTH_IMG_COMPRESS", "False").lower() == "true"
 BATCH_BUFFER_SIZE_LIMIT = int(os.getenv("BATCH_BUFFER_SIZE_LIMIT", str(1024 * 1024)))
 # Timeout for flushing batch buffer (in seconds). Default: 0.05 (50ms)
 BATCH_BUFFER_TIMEOUT = float(os.getenv("BATCH_BUFFER_TIMEOUT", "0.05"))
+
+# Sliding Window Cache Size (number of frames)
+SLIDING_WINDOW_CACHE_SIZE = int(os.getenv("SLIDING_WINDOW_CACHE_SIZE", "300"))
+
+# Source Scanning Thread Count (IO bound, default to 8 or CPU*2)
+_default_scan_threads = (os.cpu_count() or 4) * 2
+SCAN_THREAD_COUNT = int(os.getenv("SCAN_THREAD_COUNT", str(_default_scan_threads)))

@@ -16,11 +16,12 @@ class RerunInterfaceHelper:
         backend_host: str = None,
         src_db: str = "",
         src_col: str = "",
-        recording_uuid: str = ""
+        recording_uuid: str = "",
+        streaming_mode: bool = False
     ) -> str:
         actual_host = backend_host or BACKEND_HOST
         
-        minimal_rating_interface_md = RerunInterfaceHelper._minimal_rating_interface(doc, actual_host, src_db, src_col, recording_uuid)
+        minimal_rating_interface_md = RerunInterfaceHelper._minimal_rating_interface(doc, actual_host, src_db, src_col, recording_uuid, streaming_mode)
 
         parts = [
             minimal_rating_interface_md,
@@ -62,13 +63,17 @@ class RerunInterfaceHelper:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _minimal_rating_interface(doc: Dict[str, Any], host: str, db: str, col: str, uuid: str) -> str:
+    def _minimal_rating_interface(doc: Dict[str, Any], host: str, db: str, col: str, uuid: str, streaming_mode: bool = False) -> str:
         source_name = doc.get("info", {}).get("source")
         current_rating = TaggerLogic.get_current_rating(doc.get("tag"))
         rating_display = f"## `{current_rating}`" if current_rating != "Unrated" else "*Unrated*"
         url = f"http://{host}/quick_rate_source"
         safe_source = quote(str(source_name))
-        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&source={safe_source}&recording_uuid={uuid})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
+        
+        # 根据 streaming_mode 决定是否刷新
+        refresh_val = "false" if streaming_mode else "true"
+        
+        links = [f"[{s}]({url}?score={s}&db={db}&col={col}&source={safe_source}&recording_uuid={uuid}&refresh={refresh_val})" for s in sorted(list(TaggerLogic.VALID_RATINGS))]
         rating_btn = " &nbsp; | &nbsp; ".join(links)
         return (
             "## Data Quality\n\n"

@@ -185,6 +185,9 @@ async def quick_rate_collection(
     col: str = Query(...),
     recording_uuid: Optional[str] = None
 ):
+    if not recording_uuid:
+        logger.warning("quick_rate_collection: recording_uuid is missing in query params!")
+
     try:
         # 1. 构造配置并调用逻辑
         config = RateCollectionConfig(
@@ -210,7 +213,8 @@ async def quick_rate_collection(
             "score": score,
             "processed_count": processed_count,
             "color": "#16a085",  # 成功的主题色
-            "countdown": 10      # 倒计时秒数
+            "countdown": 10,      # 倒计时秒数
+            "recording_uuid": recording_uuid
         })
     except Exception as e:
         return HTMLResponse(content=f"<h3>全量打分失败: {str(e)}</h3>", status_code=500)
@@ -253,9 +257,13 @@ async def quick_rate_source(
     col: str = Query(...),
     source: str = Query(...),
     score: str = Query(...),
-    recording_uuid: Optional[str] = None
+    recording_uuid: Optional[str] = None,
+    refresh: bool = Query(True) # 可选参数：是否触发刷新
 ):
     """供 Rerun Markdown 面板直接点击跳转的 HTML 接口"""
+    if not recording_uuid:
+        logger.warning(f"quick_rate_source: recording_uuid is missing! Source: {source}")
+
     try:
         # 调用 Service 处理逻辑
         processed_count = await RatingService.rate_by_source(
@@ -266,7 +274,8 @@ async def quick_rate_source(
             comment="Rated via Rerun Source Action"
         )
 
-        _try_ui_refresh(recording_uuid)
+        if refresh:
+            _try_ui_refresh(recording_uuid)
 
         return templates.TemplateResponse("rate_batch.html", {
             "request": request,
@@ -277,7 +286,8 @@ async def quick_rate_source(
             "processed_count": processed_count,
             "extra_info": f"Source: {source}",
             "color": "#9b59b6", # 专属紫色
-            "countdown": 10
+            "countdown": 10,
+            "recording_uuid": recording_uuid
         })
     except Exception as e:
         logger.error(f"quick_rate_source 异常: {e}")

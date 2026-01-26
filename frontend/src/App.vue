@@ -68,7 +68,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed, watch } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import RerunViewer from './components/RerunViewer.vue';
 import { useRerunStore } from './stores/rerun';
@@ -88,7 +88,7 @@ const copied = ref(false);
 // 有效帧范围列表，元素为 [start, end)
 // 例如: [[0, 100], [200, 300]]
 const loadedRanges = ref([]); 
-const isRangeLoading = ref(false); // 防止重复请求
+const pendingRanges = ref(new Set()); // 记录正在加载中的区间字符串 "start-end"
 const maxFrameIdx = ref(0); // 数据集最大帧数
 const currentPlaybackFrame = ref(0); // 当前播放帧索引
 
@@ -110,30 +110,28 @@ if (urlParam && uuidParam) {
   rerunStore.setRerunInfo(null, "", "");
 }
 
-isInitialized.value = true;
-
 // 标记初始化完成
 isInitialized.value = true;
 
-// 核心联动：根据选中的数据库计算数据集列表
-const availableDatasets = computed(() => {
-  if (!selectedDB.value || !rerunStore.dbStructure) return [];
-  return rerunStore.dbStructure[selectedDB.value] || [];
-});
+// // 核心联动：根据选中的数据库计算数据集列表
+// const availableDatasets = computed(() => {
+//   if (!selectedDB.value || !rerunStore.dbStructure) return [];
+//   return rerunStore.dbStructure[selectedDB.value] || [];
+// });
 
-// 解决无法重选的问题：点击输入框时清空内容以弹出完整列表
-const handleDBFocus = () => {
-  selectedDB.value = '';
-};
+// // 解决无法重选的问题：点击输入框时清空内容以弹出完整列表
+// const handleDBFocus = () => {
+//   selectedDB.value = '';
+// };
 
-const handleDSFocus = () => {
-  selectedDataset.value = '';
-};
+// const handleDSFocus = () => {
+//   selectedDataset.value = '';
+// };
 
-// 当数据库内容改变时，清空已选的数据集
-const onDBChange = () => {
-  selectedDataset.value = '';
-};
+// // 当数据库内容改变时，清空已选的数据集
+// const onDBChange = () => {
+//   selectedDataset.value = '';
+// };
 
 // --- 核心函数：发送心跳 ---
 const sendHeartbeat = async () => {
@@ -182,8 +180,57 @@ watch(recordingUuid, (newId) => {
   }
 });
 
+// --- 全局消息监听处理 ---
+const handleGlobalMessage = async (event) => {
+  // 监听打分完成消息
+  if (event.data?.type === "RERUN_RATING_COMPLETE") {
+    console.log("收到打分完成消息:", event.data);
+    
+    // 1. 校验 UUID 是否匹配当前会话
+    if (event.data.recording_uuid === recordingUuid.value) {
+      console.log("UUID 匹配，正在请求刷新 UI...");
+      
+      try {
+        // 2. 构造刷新请求，附带当前已加载的区间
+        // 注意：loadedRanges 是 Ref 对象，需要取 .value
+        const payload = {
+          recording_uuid: recordingUuid.value,
+          loaded_ranges: loadedRanges.value
+        };
+
+        const res = await fetch(API_ENDPOINTS.REFRESH_UI(recordingUuid.value), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+          console.log("[UI Refresh] 刷新请求发送成功");
+          ElNotification({
+            title: '评分同步',
+            message: '评分已更新，正在刷新界面...',
+            type: 'success',
+            duration: 2000
+          });
+        } else {
+          console.warn("[UI Refresh] 刷新请求失败", res.status);
+        }
+      } catch (e) {
+        console.error("[UI Refresh] 网络异常", e);
+      }
+    } else {
+      console.log(`UUID 不匹配 (期望: ${recordingUuid.value}, 收到: ${event.data.recording_uuid})，忽略消息`);
+    }
+  }
+};
+
 // 页面初始化：加载后端数据库结构
 onMounted(async () => {
+  // 注册全局消息监听
+  window.addEventListener('message', handleGlobalMessage);
+
   // 1. 解析 URL 参数 (例如: ?rerun_url=rrd://localhost:9876&source_uuid=123-456)
   const params = new URLSearchParams(window.location.search);
   const urlParam = params.get('rerun_url'); // 对应你说的 rerun url
@@ -223,6 +270,7 @@ onMounted(async () => {
     // 如果是直连模式 (URL带参数)，需要额外获取一次 Session 信息 (主要是 max_frame_idx)
     if (RERUN_CONFIG.STREAMING_MODE) {
         try {
+            // 1. 获取 Session 信息
             const res = await fetch(API_ENDPOINTS.GET_INFO(recordingUuid.value));
             if (res.ok) {
                 const info = await res.json();
@@ -231,8 +279,17 @@ onMounted(async () => {
                     console.log(`[Stream] 初始化获取最大帧数: ${maxFrameIdx.value}`);
                 }
             }
+            
+            // 2. 显式通知后端开启流式模式 (以防 Session 不是通过 create_source 创建的)
+            await fetch(API_ENDPOINTS.ENABLE_STREAMING(recordingUuid.value), { method: 'POST' });
+            
+            // 3. 显式通知后端开启对齐模式 (推荐流式模式下开启以减少抖动)
+            await fetch(API_ENDPOINTS.ENABLE_ALIGNMENT(recordingUuid.value), { method: 'POST' });
+            
+            console.log("[Stream] 已通知后端开启流式模式 & 对齐模式");
+            
         } catch (e) {
-            console.warn("[Stream] 获取 Session 信息失败", e);
+            console.warn("[Stream] 初始化 Session 失败", e);
         }
     }
     
@@ -255,11 +312,19 @@ onMounted(async () => {
         console.log("【流式模式】已就绪，正在预加载初始数据...");
         // 预加载第一批数据
         await handleLoadRange(0, RERUN_CONFIG.STREAMING_BATCH_SIZE);
+        
+        // 强制跳转到第0帧，确保播放器指针归位
+        jumpToTime("frame_idx", 0);
     } else {
         // 经典模式：一次性全量加载
         await handlePlayData(); 
     }
   }
+});
+
+onUnmounted(() => {
+  stopHeartbeatLoop();
+  window.removeEventListener('message', handleGlobalMessage);
 });
 
 const waitForRerunReady = () => {
@@ -286,6 +351,22 @@ const waitForRerunReady = () => {
 const getRerunWindow = () => {
     // 通过组件 ref 获取，比 querySelector 更安全
     return rerunViewerRef.value?.getWindow();
+};
+
+// 让 Rerun Viewer 跳转到指定时间点
+const jumpToTime = (timeline, timeVal) => {
+    const win = getRerunWindow();
+    if (win) {
+        console.log(`[Stream] 调用 Rerun Jump: ${timeline} -> ${timeVal}`);
+        win.postMessage({
+            type: "rerun_set_time",
+            recording_id: recordingUuid.value,
+            timeline: timeline,
+            time: timeVal
+        }, "*");
+    } else {
+        console.warn("[Stream] 无法获取 iframe window，跳转失败");
+    }
 };
 
 // 调用 Rerun 内部接口清理数据
@@ -317,170 +398,79 @@ const handleCacheCleanup = () => {
     const MAX_CACHED = RERUN_CONFIG.STREAMING_MAX_CACHED_FRAMES || 1000;
     if (totalCached <= MAX_CACHED) return;
     
-    console.log(`[Stream] 缓存超标 (${totalCached} > ${MAX_CACHED})，执行清理...`);
+    console.log(`[Stream] 缓存超标 (${totalCached} > ${MAX_CACHED})，执行窗口清理策略...`);
     
-    let framesToDrop = RERUN_CONFIG.STREAMING_DROP_CHUNK_SIZE || 100;
-    let newRanges = [...loadedRanges.value];
+    const currentFrame = currentPlaybackFrame.value;
+    // 动态计算窗口大小：BatchSize * 系数
+    const BATCH_SIZE = RERUN_CONFIG.STREAMING_BATCH_SIZE || 100;
+    const RATIO = RERUN_CONFIG.STREAMING_KEEP_WINDOW_RATIO || 5.0;
+    const KEEP_WINDOW = Math.ceil(BATCH_SIZE * RATIO);
     
-    // 策略：找到距离 currentPlaybackFrame 最远的区间进行清理
-    // 保护规则：绝对不删除 0 帧和 maxFrameIdx (最后一帧) 所在的区间片段
-    // 简化实现：我们寻找“候选删除区间”，计算它们到当前帧的距离，然后删除最远的一个
+    const halfWindow = Math.floor(KEEP_WINDOW / 2);
     
-    while (framesToDrop > 0 && newRanges.length > 0) {
-        let bestCandidateIdx = -1;
-        let maxDistance = -1;
-        let isHeadTruncate = false; // true: 删头部, false: 删尾部
+    // 计算保留窗口范围 [keepStart, keepEnd]
+    const keepStart = Math.max(0, currentFrame - halfWindow);
+    const keepEnd = currentFrame + halfWindow;
+
+    let newRanges = [];
+
+    // 简单窗口保留策略：遍历所有区间，只保留在窗口内的部分
+    for (const range of loadedRanges.value) {
+        let [start, end] = range;
         
-        const currentFrame = currentPlaybackFrame.value;
+        // 标记该区间是否原本包含第0帧
+        const originallyContainsFirstFrame = (start === 0);
         
-        for (let i = 0; i < newRanges.length; i++) {
-            const range = newRanges[i];
-            const start = range[0];
-            const end = range[1]; // exclusive
+        // 1. 裁剪头部：[start, keepStart)
+        if (start < keepStart) {
+            let dropEnd = Math.min(end, keepStart);
             
-            // 保护首尾帧 (如果是包含首尾的区间，我们只允许从“非首尾”那一端进行缩减)
-            // 如果区间非常小且包含了首或尾，可能直接跳过不删
-            const containsStart = (start === 0);
-            const containsEnd = (maxFrameIdx.value > 0 && end >= maxFrameIdx.value);
-            
-            // 如果一个区间既包含头又包含尾（也就是全量数据），且包含当前帧，那只能暂不处理或切分
-            // 修正：即使包含当前帧，如果它足够长，我们也应该允许清理远离当前帧的部分
-            const BUFFER_ZONE = 100; // 保留当前帧前后 100 帧不被清理
-            
-            // 检查区间是否“完全”在安全区内（即整个区间都离当前帧太近，无法清理）
-            // 如果区间包含当前帧，我们需要确保至少有一端延伸到了安全区之外
-            if (currentFrame >= start && currentFrame < end) {
-                const distToStart = currentFrame - start;
-                const distToEnd = end - currentFrame;
-                if (distToStart < BUFFER_ZONE && distToEnd < BUFFER_ZONE) {
-                    continue; // 整个区间都在安全区内，跳过
-                }
-            }
-            
-            // 计算距离：区间中心点到当前帧的距离
-            const center = (start + end) / 2;
-            const distance = Math.abs(center - currentFrame);
-            
-            // 检查是否受保护导致无法删除
-            // 如果包含 0 帧，只能删尾部；如果包含 max 帧，只能删头部
-            
-            if (distance > maxDistance) {
-                // 候选资格检查
-                // 确定删除方向
-                let canTruncateHead = true;
-                let canTruncateTail = true;
-                
-                if (containsStart) canTruncateHead = false;
-                if (containsEnd) canTruncateTail = false;
-                
-                // 如果包含当前帧，方向受限：只能删离当前帧远的那一端
-                if (currentFrame >= start && currentFrame < end) {
-                    if (currentFrame - start < BUFFER_ZONE) canTruncateHead = false; // 左边太近，不能删头
-                    if (end - currentFrame < BUFFER_ZONE) canTruncateTail = false;   // 右边太近，不能删尾
-                }
-                
-                // 最终决策
-                if (canTruncateHead && canTruncateTail) {
-                    // 两头都能删，删离得远的那头
-                    // 简单判断：如果区间在左边，删头；在右边，删尾
-                    // 如果包含当前帧，看哪边长删哪边
-                    if (currentFrame >= start && currentFrame < end) {
-                         if ((currentFrame - start) > (end - currentFrame)) isHeadTruncate = true; // 左边长，删左边(头)
-                         else isHeadTruncate = false;
-                    } else {
-                        if (end <= currentFrame) isHeadTruncate = true;
-                        else isHeadTruncate = false;
-                    }
-                } else if (canTruncateHead) {
-                    isHeadTruncate = true;
-                } else if (canTruncateTail) {
-                    isHeadTruncate = false;
-                } else {
-                    continue; // 两头都锁死，跳过
-                }
-                
-                maxDistance = distance;
-                bestCandidateIdx = i;
-            }
-        }
-        
-        if (bestCandidateIdx === -1) {
-            console.warn("[Stream] 无法找到可清理的帧区间（所有区间均受保护或包含当前帧）");
-            break;
-        }
-        
-        // 执行删除
-        const targetRange = newRanges[bestCandidateIdx];
-        const rangeLen = targetRange[1] - targetRange[0];
-        
-        // 实际删除量：取 需求量 和 区间长度-1 (至少留1帧以防空) 的较小值
-        // 关键修改：如果是受保护区间，我们要确保至少保留受保护的那一帧
-        
-        let dropCount = Math.min(framesToDrop, rangeLen);
-        
-        // 安全区保护：不能删到 currentFrame 附近的 BUFFER_ZONE
-        // 如果包含当前帧，我们需要限制 dropCount
-        if (currentFrame >= targetRange[0] && currentFrame < targetRange[1]) {
-            const BUFFER_ZONE = 100;
-            let maxDroppable = 0;
-            
-            if (isHeadTruncate) {
-                // 删头：只能删到 currentFrame - BUFFER_ZONE
-                maxDroppable = Math.max(0, (currentFrame - BUFFER_ZONE) - targetRange[0]);
+            // 关键修复：如果本来包含第0帧，那么绝对不能删掉 [0, 1]
+            // 我们把删除范围限制在 [1, keepStart)
+            if (originallyContainsFirstFrame) {
+                 // 如果 dropEnd <= 1，说明整个删除请求都在保护区内，直接取消删除
+                 if (dropEnd <= 1) {
+                     // do nothing
+                 } else {
+                     // 否则，从 1 开始删
+                     callRerunDrop(1, dropEnd);
+                     // 此时 start 逻辑上变为了 dropEnd，但我们还需要保留 [0, 1]
+                     // 这里为了简单，我们先把 start 移到 dropEnd，
+                     // 然后单独把 [0, 1] 加回 newRanges (如果不连续的话)
+                     start = dropEnd;
+                 }
             } else {
-                // 删尾：只能删到 currentFrame + BUFFER_ZONE
-                maxDroppable = Math.max(0, targetRange[1] - (currentFrame + BUFFER_ZONE));
-            }
-            
-            dropCount = Math.min(dropCount, maxDroppable);
-            
-            if (dropCount <= 0) {
-                console.log("[Stream] 当前区间虽被选中，但受安全区保护无法删除，尝试下一个");
-                // 临时从列表移除避免死循环，或者直接退出
-                newRanges.splice(bestCandidateIdx, 1); 
-                continue;
+                // 普通情况，照常删除
+                if (start < dropEnd) {
+                    callRerunDrop(start, dropEnd);
+                    start = dropEnd;
+                }
             }
         }
         
-        // 如果删完会导致区间消失，但它又是受保护的，那我们至少留1帧
-        const containsStart = (targetRange[0] === 0);
-        const containsEnd = (maxFrameIdx.value > 0 && targetRange[1] >= maxFrameIdx.value);
-        
-        if ((containsStart || containsEnd) && dropCount >= rangeLen) {
-             dropCount = rangeLen - 1; // 至少留1帧
-             if (dropCount <= 0) {
-                 // 如果只剩1帧了，没法再删了，放弃这个区间，找下一个
-                 // 为了防止死循环，我们应该从 newRanges 里临时排除这个区间再试，或者直接 break
-                 // 这里简单处理：直接 break，等待下次触发
-                 console.log("[Stream] 受保护区间已压缩至最小，停止清理");
-                 break;
-             }
+        // 2. 裁剪尾部：[keepEnd, end)
+        if (end > keepEnd) {
+            const dropStart = Math.max(start, keepEnd);
+            if (dropStart < end) {
+                callRerunDrop(dropStart, end);
+                end = dropStart;
+            }
         }
         
-        // 执行 Drop API
-        if (isHeadTruncate) {
-            // 删头部: [start, end) -> [start + drop, end)
-            // 删除范围: [start, start + drop)
-            const dropStart = targetRange[0];
-            const dropEnd = targetRange[0] + dropCount;
-            
-            callRerunDrop(dropStart, dropEnd);
-            targetRange[0] += dropCount;
-        } else {
-            // 删尾部: [start, end) -> [start, end - drop)
-            // 删除范围: [end - drop, end)
-            const dropStart = targetRange[1] - dropCount;
-            const dropEnd = targetRange[1];
-            
-            callRerunDrop(dropStart, dropEnd);
-            targetRange[1] -= dropCount;
+        // 3. 保留有效部分
+        if (start < end) {
+            newRanges.push([start, end]);
         }
         
-        framesToDrop -= dropCount;
-        
-        // 如果区间空了或非法，移除它
-        if (targetRange[0] >= targetRange[1]) {
-            newRanges.splice(bestCandidateIdx, 1);
+        // 4. 补回第0帧 (如果之前因为窗口原因没包含进去)
+        if (originallyContainsFirstFrame) {
+            // 检查 newRanges 里有没有 [0, 1] 或者覆盖了 0 的区间
+            // 由于上面 start 可能被移到了 keepStart (比如 500)，所以 [0, 1] 肯定不在 newRanges 的当前 push 里
+            // 我们需要手动加回去
+            // 只有当当前的 start > 1 时才需要加，因为如果 start 还是 0 (说明窗口覆盖了头部)，那已经加进去了
+            if (start > 1) {
+                newRanges.push([0, 1]);
+            }
         }
     }
     
@@ -488,7 +478,7 @@ const handleCacheCleanup = () => {
 };
 
 const handleLoadRange = async (startIndex, count) => {
-  if (!recordingUuid.value || isRangeLoading.value) return;
+  if (!recordingUuid.value) return;
   
   // 越界检查
   if (maxFrameIdx.value > 0 && startIndex >= maxFrameIdx.value) {
@@ -496,16 +486,26 @@ const handleLoadRange = async (startIndex, count) => {
       return;
   }
   
-  isRangeLoading.value = true;
+  let endIndex = startIndex + count;
+  
+  // 截断 EndIndex
+  if (maxFrameIdx.value > 0 && endIndex > maxFrameIdx.value) {
+      endIndex = maxFrameIdx.value;
+      console.log(`[Stream] 截断加载范围至末尾: ${endIndex}`);
+  }
+  
+  // 检查是否与正在进行的请求重叠
+  // 简单策略：如果请求完全一致，或者已经被包含在 pending 中，则跳过
+  // 为了简化，我们用 "start-end" 字符串作为 key
+  const requestKey = `${startIndex}-${endIndex}`;
+  if (pendingRanges.value.has(requestKey)) {
+      console.log(`[Stream] 请求 ${requestKey} 已在队列中，跳过`);
+      return;
+  }
+  
+  pendingRanges.value.add(requestKey);
+  
   try {
-    let endIndex = startIndex + count;
-    
-    // 截断 EndIndex
-    if (maxFrameIdx.value > 0 && endIndex > maxFrameIdx.value) {
-        endIndex = maxFrameIdx.value;
-        console.log(`[Stream] 截断加载范围至末尾: ${endIndex}`);
-    }
-    
     console.log(`[Stream] 请求加载范围: [${startIndex}, ${endIndex})`);
     
     const response = await fetch(API_ENDPOINTS.LOAD_RANGE(recordingUuid.value), {
@@ -555,7 +555,7 @@ const handleLoadRange = async (startIndex, count) => {
   } catch (e) {
     console.error(`[Stream] 网络错误:`, e);
   } finally {
-    isRangeLoading.value = false;
+    pendingRanges.value.delete(requestKey);
   }
 };
 
@@ -583,21 +583,74 @@ const onTimeUpdate = (data) => {
 
 // 场景 1: 正常播放中的流式加载
 const handleStreamingPlayback = (currentFrameIdx) => {
-    // 策略：检查当前帧是否接近已加载范围的末尾
-    // 如果 (MaxLoaded - Current) < Threshold，则预加载下一批
+    // 策略：不再只看最后一个区间，而是关注“当前播放区间”的剩余量
     if (loadedRanges.value.length === 0) return;
     
-    // 找到包含当前帧的区间，或者最后一个区间
-    // 简单起见，我们关注最后一个区间的末尾
-    const lastRange = loadedRanges.value[loadedRanges.value.length - 1];
-    const maxLoadedIdx = lastRange[1]; // 区间是 [start, end)，所以 end 就是下一帧
+    const BUFFER_THRESHOLD = RERUN_CONFIG.STREAMING_BUFFER_THRESHOLD || 50;
     
-    // 剩余多少帧时触发加载
-    const BUFFER_THRESHOLD = RERUN_CONFIG.STREAMING_BUFFER_THRESHOLD || 50; 
+    // 1. 找到包含当前帧的区间
+    let activeRangeIndex = -1;
+    for (let i = 0; i < loadedRanges.value.length; i++) {
+        const range = loadedRanges.value[i];
+        if (currentFrameIdx >= range[0] && currentFrameIdx < range[1]) {
+            activeRangeIndex = i;
+            break;
+        }
+    }
     
-    if (maxLoadedIdx - currentFrameIdx < BUFFER_THRESHOLD) {
-        // 触发加载，从 maxLoadedIdx 开始
-        handleLoadRange(maxLoadedIdx, RERUN_CONFIG.STREAMING_BATCH_SIZE);
+    if (activeRangeIndex !== -1) {
+        // 我们在某个区间内
+        const currentRange = loadedRanges.value[activeRangeIndex];
+        const currentRangeEnd = currentRange[1];
+        
+        // 检查是否接近当前区间的末尾
+        if (currentRangeEnd - currentFrameIdx < BUFFER_THRESHOLD) {
+            // 准备加载的位置是当前区间的末尾
+            const loadStart = currentRangeEnd;
+            
+            // 检查后面是否还有区间 (处理空隙)
+            const nextRange = loadedRanges.value[activeRangeIndex + 1];
+            let loadCount = RERUN_CONFIG.STREAMING_BATCH_SIZE;
+            
+            // 检查是否已经在加载这个位置了 (避免重复触发)
+            // 我们检查 [loadStart, loadStart + 1] 是否在 pending 队列的某个请求范围内
+            // 由于 pending key 是 "start-end"，我们需要遍历 check
+            let isAlreadyLoading = false;
+            for (const key of pendingRanges.value) {
+                const [pStart, pEnd] = key.split('-').map(Number);
+                if (loadStart >= pStart && loadStart < pEnd) {
+                    isAlreadyLoading = true;
+                    break;
+                }
+            }
+            
+            if (isAlreadyLoading) {
+                // console.log(`[Stream] 位置 ${loadStart} 正在加载中，跳过`);
+                return;
+            }
+
+            if (nextRange) {
+                // 如果后面还有区间，计算空隙大小
+                if (loadStart < nextRange[0]) {
+                    const gapSize = nextRange[0] - loadStart;
+                    // 如果空隙比标准块小，就只加载空隙大小，避免重复加载下一块的数据
+                    if (gapSize < loadCount) {
+                        loadCount = gapSize;
+                    }
+                    // 触发加载
+                    handleLoadRange(loadStart, loadCount);
+                }
+                // 如果没有空隙 (loadStart == nextRange[0])，说明数据连续，无需加载，自然播放过去即可
+            } else {
+                // 后面没有区间了，正常往后加载
+                handleLoadRange(loadStart, loadCount);
+            }
+        }
+    } else {
+        // 当前帧不在任何已加载区间内
+        // 这通常发生在播放指针刚跳出区间，或者处于空隙中
+        // 尝试立即加载当前位置
+        handleLoadRange(currentFrameIdx, RERUN_CONFIG.STREAMING_BATCH_SIZE);
     }
 };
 
@@ -674,25 +727,25 @@ const handlePlayData = async () => {
   }
 };
 
-const copyToClipboard = async () => {
-  if (!currentSource.value) return;
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(currentSource.value);
-    } else {
-      const textArea = document.createElement("textarea");
-      textArea.value = currentSource.value;
-      document.body.appendChild(textArea);
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-    }
-    copied.value = true;
-    setTimeout(() => copied.value = false, 2000);
-  } catch (err) {
-    console.error('Copy failed');
-  }
-};
+// const copyToClipboard = async () => {
+//   if (!currentSource.value) return;
+//   try {
+//     if (navigator.clipboard && window.isSecureContext) {
+//       await navigator.clipboard.writeText(currentSource.value);
+//     } else {
+//       const textArea = document.createElement("textarea");
+//       textArea.value = currentSource.value;
+//       document.body.appendChild(textArea);
+//       textArea.select();
+//       document.execCommand('copy');
+//       document.body.removeChild(textArea);
+//     }
+//     copied.value = true;
+//     setTimeout(() => copied.value = false, 2000);
+//   } catch (err) {
+//     console.error('Copy failed');
+//   }
+// };
 </script>
 
 <style scoped>

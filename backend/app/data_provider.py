@@ -89,6 +89,25 @@ class DataManager:
             return 0, 1000 # Fallback
 
     @staticmethod
+    def aggregate(database: str, collection: str, pipeline: List[Dict]) -> List[Dict]:
+        """
+        执行 MongoDB 聚合管道
+        """
+        client = DataManager.get_client()
+        try:
+            if hasattr(client, 'aggregate'):
+                # 如果 DataClient 封装了 aggregate
+                return list(client.aggregate(database, collection, pipeline))
+            else:
+                # Fallback: 使用底层 PyMongo client
+                db = client.client[database]
+                col = db[collection]
+                return list(col.aggregate(pipeline))
+        except Exception as e:
+            logger.error(f"Aggregation Error: {e}")
+            return []
+
+    @staticmethod
     def fetch_frames(
         database: str, 
         collection: str,

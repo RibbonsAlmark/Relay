@@ -2,6 +2,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any
 from .data_provider import DataManager
+from app.config import SCAN_THREAD_COUNT
 
 def process_chunk(chunk_data: List[tuple]) -> Dict[str, int]:
     """
@@ -22,64 +23,75 @@ def process_chunk(chunk_data: List[tuple]) -> Dict[str, int]:
                 local_results[s_id] = idx
     return local_results
 
-def get_global_sources(dataset: str, collection: str, start_index: int = 0, max_workers: int = 8, existing_iter: List[Dict] = None) -> List[Dict[str, Any]]:
+def get_global_sources(dataset: str, collection: str, start_index: int = 0, max_workers: int = SCAN_THREAD_COUNT, existing_iter: List[Dict] = None) -> List[Dict[str, Any]]:
     """
-    高效扫描数据集，提取所有数据源。
-    优化点：
-    1. 局部处理减少锁竞争。
-    2. 字段过滤（需 DataManager 支持）。
-    3. 支持复用已有的迭代器/列表 (existing_iter)。
+    并发扫描数据集提取数据源及其首次出现的帧序号。
+    使用多线程分片 (Skip-Limit) 并行拉取，大幅提升初始化速度。
+    线程安全策略：Map-Reduce (局部计算，主线程合并)
     """
-    global_source_map = {}
-    logging.info(f"开始扫描数据集 {dataset}/{collection}，并发数: {max_workers}")
+    logging.info(f"开始扫描数据集 {dataset}/{collection} 以提取 Source Catalog (Parallel Scan, workers={max_workers})...")
+    sources_map = {}
+    
+    try:
+        # 1. 获取总数以计算分片
+        total_count = DataManager.get_collection_count(dataset, collection)
+        if total_count == 0:
+            return []
 
-    if existing_iter is not None:
-        # 如果提供了现成的数据列表，直接使用
-        frames_iter = existing_iter
-    else:
-        # 关键优化：如果 DataManager 支持 projection，只取 'info.source' 字段
-        # 这将减少 90% 以上的网络传输和内存占用
-        # 示例假设 fetch_frames_iter 接受 projection 参数
-        try:
-            frames_iter = DataManager.fetch_frames_iter(
-                dataset, 
-                collection, 
-                projection={"info.source": 1} 
-            )
-        except TypeError:
-            # 降级处理：如果不支持字段过滤，速度会受限于文档大小
-            frames_iter = DataManager.fetch_frames_iter(dataset, collection)
-
-    chunk_size = 500  # 适当增大块大小
-    current_chunk = []
-    futures = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 1. 提交任务
-        for current_idx, doc in enumerate(frames_iter, start=start_index):
-            current_chunk.append((current_idx, doc))
-            
-            if len(current_chunk) >= chunk_size:
-                futures.append(executor.submit(process_chunk, current_chunk))
-                current_chunk = []
-        
-        if current_chunk:
-            futures.append(executor.submit(process_chunk, current_chunk))
-
-        # 2. 合并结果 (在主线程进行，天然线程安全)
-        for future in as_completed(futures):
+        # 2. 定义分片任务
+        def _scan_chunk(chunk_offset: int, chunk_limit: int) -> Dict[str, int]:
+            local_map = {}
             try:
-                local_map = future.result()
-                for s_id, idx in local_map.items():
-                    if s_id not in global_source_map or idx < global_source_map[s_id]:
-                        global_source_map[s_id] = idx
+                # 只取 info.source
+                cursor = DataManager.fetch_frames(
+                    dataset, 
+                    collection, 
+                    skip=chunk_offset,
+                    limit=chunk_limit,
+                    projection={"info.source": 1}
+                )
+                for i, doc in enumerate(cursor):
+                    s = doc.get("info", {}).get("source")
+                    # 记录局部相对索引
+                    if s and s not in local_map:
+                        local_map[s] = chunk_offset + i
             except Exception as e:
-                logging.error(f"处理数据块时出错: {e}")
+                logging.error(f"Chunk scan failed at {chunk_offset}: {e}")
+            return local_map
 
-    # 3. 构造最终结果并排序
+        # 3. 并发执行
+        chunk_size = (total_count + max_workers - 1) // max_workers
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i in range(max_workers):
+                c_start = i * chunk_size
+                if c_start >= total_count:
+                    break
+                c_limit = min(chunk_size, total_count - c_start)
+                futures.append(executor.submit(_scan_chunk, c_start, c_limit))
+            
+            # 4. 合并结果
+            for future in as_completed(futures):
+                try:
+                    part_map = future.result()
+                    for s, idx in part_map.items():
+                        # 全局合并：保留最小的 index (即最早出现的)
+                        # 注意：这里需要加上外部传入的 start_index 偏移
+                        global_idx = idx + start_index
+                        if s not in sources_map or global_idx < sources_map[s]:
+                            sources_map[s] = global_idx
+                except Exception as e:
+                    logging.error(f"Worker failed: {e}")
+
+    except Exception as e:
+        logging.error(f"Source scan failed: {e}")
+        return []
+
+    # 构造结果
     manifest = [
         {"source": s_id, "index": idx}
-        for s_id, idx in global_source_map.items()
+        for s_id, idx in sources_map.items()
     ]
     manifest.sort(key=lambda x: x["index"])
 
