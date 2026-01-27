@@ -1,6 +1,5 @@
 <template>
-  <div id="app">
-    
+  <div id="app" :class="{ 'is-dragging': isDragging }">
     <!-- <div class="controls">
       <div class="input-group">
         <label>数据库：</label>
@@ -59,18 +58,26 @@
       </div>
     </div> -->
 
+    
     <RerunViewer 
       v-if="isInitialized" 
       ref="rerunViewerRef"
       :source="currentSource" 
     />
+
+    <FloatingButton 
+      :on-reload="handleManualReload"
+      @drag-start="isDragging = true"
+      @drag-end="isDragging = false"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
 import { storeToRefs } from 'pinia';
 import RerunViewer from './components/RerunViewer.vue';
+import FloatingButton from './components/FloatingButton.vue';
 import { useRerunStore } from './stores/rerun';
 import { API_ENDPOINTS, RERUN_CONFIG } from './config';
 import { ElNotification } from 'element-plus'; 
@@ -78,11 +85,11 @@ import { ElNotification } from 'element-plus';
 const rerunStore = useRerunStore();
 const { recordingUuid, currentSource } = storeToRefs(rerunStore);
 
-const selectedDB = ref('');
-const selectedDataset = ref('');
-const loading = ref(false);
+// const selectedDB = ref('');
+// const selectedDataset = ref('');
+// const loading = ref(false);
 const playing = ref(false);
-const copied = ref(false);
+// const copied = ref(false);
 
 // 流式加载状态管理
 // 有效帧范围列表，元素为 [start, end)
@@ -91,6 +98,7 @@ const loadedRanges = ref([]);
 const pendingRanges = ref(new Set()); // 记录正在加载中的区间字符串 "start-end"
 const maxFrameIdx = ref(0); // 数据集最大帧数
 const currentPlaybackFrame = ref(0); // 当前播放帧索引
+const isDragging = ref(false); // 控制 iframe 穿透
 
 
 // 直接在 setup 顶层运行，不要等到 onMounted
@@ -420,6 +428,9 @@ const handleCacheCleanup = () => {
         
         // 标记该区间是否原本包含第0帧
         const originallyContainsFirstFrame = (start === 0);
+        // 标记该区间是否原本包含最后一帧 (注意: maxFrameIdx 是开区间上限，所以有效帧是 maxFrameIdx-1)
+        // 但这里 range 是 [start, end)，如果 end == maxFrameIdx.value，说明包含了最后一帧
+        const originallyContainsLastFrame = (maxFrameIdx.value > 0 && end === maxFrameIdx.value);
         
         // 1. 裁剪头部：[start, keepStart)
         if (start < keepStart) {
@@ -451,9 +462,26 @@ const handleCacheCleanup = () => {
         // 2. 裁剪尾部：[keepEnd, end)
         if (end > keepEnd) {
             const dropStart = Math.max(start, keepEnd);
-            if (dropStart < end) {
-                callRerunDrop(dropStart, end);
-                end = dropStart;
+            
+            // 关键修复：如果本来包含最后一帧，那么绝对不能删掉 [maxFrameIdx-1, maxFrameIdx]
+            if (originallyContainsLastFrame) {
+                // 保护区是 [maxFrameIdx-1, maxFrameIdx]
+                const protectedStart = maxFrameIdx.value - 1;
+                
+                // 如果 dropStart >= protectedStart，说明删除请求全在保护区内（或之后），直接取消删除
+                if (dropStart >= protectedStart) {
+                    // do nothing
+                } else {
+                    // 否则，删到 protectedStart 为止: [dropStart, protectedStart)
+                    // 也就是保留了 [protectedStart, end)
+                    callRerunDrop(dropStart, protectedStart);
+                    end = dropStart; // 逻辑上 end 变为了 dropStart
+                }
+            } else {
+                if (dropStart < end) {
+                    callRerunDrop(dropStart, end);
+                    end = dropStart;
+                }
             }
         }
         
@@ -472,7 +500,20 @@ const handleCacheCleanup = () => {
                 newRanges.push([0, 1]);
             }
         }
+
+        // 5. 补回最后一帧 (如果之前因为窗口原因没包含进去)
+        if (originallyContainsLastFrame) {
+             const lastFrameStart = maxFrameIdx.value - 1;
+             // 如果当前的 end 被裁剪到了 lastFrameStart 之前 (或者等于)，说明最后一帧被切掉了
+             // 我们需要手动加回去 [lastFrameStart, maxFrameIdx]
+             if (end <= lastFrameStart) {
+                 newRanges.push([lastFrameStart, maxFrameIdx.value]);
+             }
+        }
     }
+    
+    // 重新排序，因为补回的首尾帧可能会打乱顺序
+    newRanges.sort((a, b) => a[0] - b[0]);
     
     loadedRanges.value = newRanges;
 };
@@ -584,7 +625,7 @@ const onTimeUpdate = (data) => {
 // 场景 1: 正常播放中的流式加载
 const handleStreamingPlayback = (currentFrameIdx) => {
     // 策略：不再只看最后一个区间，而是关注“当前播放区间”的剩余量
-    if (loadedRanges.value.length === 0) return;
+    // if (loadedRanges.value.length === 0) return;
     
     const BUFFER_THRESHOLD = RERUN_CONFIG.STREAMING_BUFFER_THRESHOLD || 50;
     
@@ -746,6 +787,26 @@ const handlePlayData = async () => {
 //     console.error('Copy failed');
 //   }
 // };
+
+// 手动触发重新加载
+const handleManualReload = () => {
+  if (!recordingUuid.value) return;
+  
+  const startFrame = currentPlaybackFrame.value;
+  const count = RERUN_CONFIG.STREAMING_BATCH_SIZE || 100;
+  
+  console.log(`[Manual Reload] 用户手动触发加载: Start=${startFrame}, Count=${count}`);
+  
+  handleLoadRange(startFrame, count);
+  
+  ElNotification({
+    title: '重新加载',
+    message: `正在尝试重新加载帧 ${startFrame} 及其后续数据...`,
+    type: 'info',
+    position: 'bottom-left',
+    duration: 2000
+  });
+};
 </script>
 
 <style scoped>
@@ -797,6 +858,7 @@ input:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .generate-btn { background: #4CAF50; color: white; }
 .generate-btn:hover { background: #45a049; }
+
 .generate-btn:disabled { background: #2a2a2a; color: #666; cursor: not-allowed; }
 
 .play-btn { background: #2196F3; color: white; }
@@ -808,4 +870,9 @@ input:disabled { opacity: 0.4; cursor: not-allowed; }
 .result-box { display: flex; align-items: center; gap: 12px; background: #111; padding: 6px 12px; border-radius: 4px; border: 1px solid #333; cursor: pointer; }
 .url-text { font-family: 'Fira Code', monospace; font-size: 12px; color: #888; }
 .copy-icon { font-size: 12px; }
+
+/* 关键修复：拖拽时禁用 iframe 响应，防止鼠标事件被吞噬 */
+.is-dragging :deep(iframe) {
+  pointer-events: none;
+}
 </style>
