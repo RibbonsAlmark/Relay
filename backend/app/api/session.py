@@ -121,7 +121,7 @@ async def send_sentinel(recording_uuid: str, frame_idx: int = 0):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
         
-    session.send_sentinel_frame(frame_idx)
+    session.send_sentinel_frame()
     return {"status": "success", "recording_uuid": recording_uuid, "frame_idx": frame_idx}
 
 @router.post("/play_data/{recording_uuid}")

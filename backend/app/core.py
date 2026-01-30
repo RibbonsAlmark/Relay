@@ -83,6 +83,7 @@ class RerunSession:
 
         # 线程锁
         self.log_lock = threading.Lock()
+        self.rerun_send_lock = threading.Lock() # [New] 保护 Rerun SDK 的 set_time + log 原子性
 
         # 1. Source Catalog 独立线程初始化
         self._source_catalog_cache = []
@@ -127,8 +128,9 @@ class RerunSession:
                 # Log source_catalog to frame 0 immediately
                 if result:
                     catalog_json = json.dumps(result, ensure_ascii=False)
-                    self.stream.set_time("frame_idx", sequence=0)
-                    self.stream.log("meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"))
+                    with self.rerun_send_lock:
+                        self.stream.set_time("frame_idx", sequence=0)
+                        self.stream.log("meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"))
                     
             except Exception as e:
                 logger.error(f"[{self.recording_uuid}] Source Catalog Init Failed: {e}")
@@ -142,10 +144,11 @@ class RerunSession:
         try:
             total_count = DataManager.get_collection_count(dataset, collection)
             if total_count > 0:
-                self.stream.set_time("frame_idx", sequence=0)
-                self.stream.log("internal/range_marker", rr.TextLog("Start"))
-                self.stream.set_time("frame_idx", sequence=total_count - 1)
-                self.stream.log("internal/range_marker", rr.TextLog("End"))
+                with self.rerun_send_lock:
+                    self.stream.set_time("frame_idx", sequence=0)
+                    self.stream.log("internal/range_marker", rr.TextLog("Start"))
+                    self.stream.set_time("frame_idx", sequence=total_count - 1)
+                    self.stream.log("internal/range_marker", rr.TextLog("End"))
                 self.max_frame_idx = total_count
         except Exception as e:
             logger.error(f"Failed to set range markers: {e}")
@@ -456,12 +459,22 @@ class RerunSession:
         或者作为一个明确的信号表明“在此之前的数据已作废”。
         """
         try:
-            self.stream.set_time("frame_idx", sequence=0)
-            self.stream.log("internal/range_marker", rr.TextLog("Start"))
-            self.stream.set_time("frame_idx", sequence=self.max_frame_idx - 1)
-            self.stream.log("internal/range_marker", rr.TextLog("End"))
-            self.stream.set_time("frame_idx", sequence=0)
-            self.stream.log("meta/source_catalog", rr.TextDocument(json.dumps(self._source_catalog_cache, ensure_ascii=False), media_type="text/json"))
+            with self.rerun_send_lock:
+                # 重新发送 Range Markers 和 Source Catalog 以强制刷新 Viewer 状态
+                self.stream.set_time("frame_idx", sequence=0)
+                self.stream.log("internal/range_marker", rr.TextLog("Start"))
+                
+                if self.max_frame_idx > 0:
+                    self.stream.set_time("frame_idx", sequence=self.max_frame_idx - 1)
+                    self.stream.log("internal/range_marker", rr.TextLog("End"))
+                
+                # 使用缓存的 source_catalog
+                if self._source_catalog_cache:
+                    self.stream.set_time("frame_idx", sequence=0)
+                    catalog_json = json.dumps(self._source_catalog_cache, ensure_ascii=False)
+                    self.stream.log("meta/source_catalog", rr.TextDocument(catalog_json, media_type="text/json"))
+                
+            logger.info(f"[{self.recording_uuid}] Sent sentinel frame (Refreshed Markers & Catalog)")
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] Failed to send sentinel frame: {e}")
 
@@ -706,11 +719,12 @@ class RerunSession:
                     # 回退到逐个发送
                     for idx, comp in items:
                         try:
-                            self.stream.set_time("frame_idx", sequence=idx)
-                            if isinstance(comp, list):
-                                self.stream.log(path, *comp)
-                            else:
-                                self.stream.log(path, comp)
+                            with self.rerun_send_lock:
+                                self.stream.set_time("frame_idx", sequence=idx)
+                                if isinstance(comp, list):
+                                    self.stream.log(path, *comp)
+                                else:
+                                    self.stream.log(path, comp)
                         except Exception as e:
                             logger.error(f"Fallback log failed for {path} at {idx}: {e}")
             except Exception as e:
