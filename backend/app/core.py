@@ -120,7 +120,7 @@ class RerunSession:
                     dataset=dataset,
                     collection=collection
                 )
-                json.dumps(result, ensure_ascii=False) = result
+                self._source_catalog_cache = result
                 t1 = time.time()
                 logger.debug(f"[{self.recording_uuid}] Source Catalog 初始化完成，耗时 {t1 - t0:.2f}s")
                 
@@ -461,7 +461,7 @@ class RerunSession:
             self.stream.set_time("frame_idx", sequence=self.max_frame_idx - 1)
             self.stream.log("internal/range_marker", rr.TextLog("End"))
             self.stream.set_time("frame_idx", sequence=0)
-            self.stream.log("meta/source_catalog", rr.TextDocument(json.dumps(json.dumps(result, ensure_ascii=False), ensure_ascii=False), media_type="text/json"))
+            self.stream.log("meta/source_catalog", rr.TextDocument(json.dumps(self._source_catalog_cache, ensure_ascii=False), media_type="text/json"))
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] Failed to send sentinel frame: {e}")
 
