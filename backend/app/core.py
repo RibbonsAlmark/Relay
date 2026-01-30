@@ -421,6 +421,48 @@ class RerunSession:
         """外部调用此方法续命"""
         self.last_heartbeat = time.time()
 
+    def clear_pending_queues(self):
+        """
+        [Backpressure] 紧急制动：清空所有待发送队列。
+        用于在用户拖拽进度条或重置播放时，丢弃不再需要的陈旧数据。
+        """
+        logger.warning(f"[{self.recording_uuid}] Clearing all pending queues...")
+        
+        # 1. 清空顺序队列
+        while not self.seq_queue.empty():
+            try: self.seq_queue.get_nowait()
+            except: break
+            
+        # 2. 清空异步队列
+        while not self.async_queue.empty():
+            try: self.async_queue.get_nowait()
+            except: break
+            
+        # 3. 清空对齐队列
+        while not self.aligned_queue.empty():
+            try: self.aligned_queue.get_nowait()
+            except: break
+            
+        # 4. 清空对齐缓冲区
+        with self.alignment_lock:
+            self.alignment_buffer.clear()
+            
+        logger.info(f"[{self.recording_uuid}] Queues cleared.")
+
+    def send_sentinel_frame(self, frame_idx: int):
+        """
+        发送一个“哨兵帧”（Sentinel Frame）。
+        这是一个仅包含时间戳的空帧，用于通知前端 Rerun Viewer 强制刷新时间轴，
+        或者作为一个明确的信号表明“在此之前的数据已作废”。
+        """
+        try:
+            # 记录一个空的 TextLog 作为标记，确保时间轴更新
+            self.stream.set_time("frame_idx", sequence=frame_idx)
+            self.stream.log("internal/sentinel", rr.TextLog(f"Sentinel Frame: {frame_idx}"))
+            logger.info(f"[{self.recording_uuid}] Sent sentinel frame at {frame_idx}")
+        except Exception as e:
+            logger.error(f"[{self.recording_uuid}] Failed to send sentinel frame: {e}")
+
     def push_frames(self, frames: list, start_idx: int = 0):
         """
         对外数据推送接口：支持历史覆盖、增量追加与精确插入。

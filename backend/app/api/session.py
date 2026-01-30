@@ -98,6 +98,32 @@ async def enable_alignment_mode(recording_uuid: str):
     session.set_alignment_mode(True)
     return {"status": "success", "recording_uuid": recording_uuid, "alignment_mode": True}
 
+@router.post("/clear_queues/{recording_uuid}")
+async def clear_queues(recording_uuid: str):
+    """紧急清空所有待发送队列"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    session.clear_pending_queues()
+    return {"status": "success", "recording_uuid": recording_uuid, "message": "Queues cleared"}
+
+@router.post("/send_sentinel/{recording_uuid}")
+async def send_sentinel(recording_uuid: str, frame_idx: int = 0):
+    """发送哨兵帧"""
+    session = None
+    with manager.lock:
+        session = manager.sessions.get(recording_uuid)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    session.send_sentinel_frame(frame_idx)
+    return {"status": "success", "recording_uuid": recording_uuid, "frame_idx": frame_idx}
+
 @router.post("/play_data/{recording_uuid}")
 async def play_data(recording_uuid: str):
     """触发指定 UUID 会话的回放"""
