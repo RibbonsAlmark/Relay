@@ -452,7 +452,7 @@ class RerunSession:
             
         logger.info(f"[{self.recording_uuid}] Queues cleared.")
 
-    def send_sentinel_frame(self, frame_idx: int):
+    def send_sentinel_frame(self):
         """
         发送一个“哨兵帧”（Sentinel Frame）。
         这是一个仅包含时间戳的空帧，用于通知前端 Rerun Viewer 强制刷新时间轴，
