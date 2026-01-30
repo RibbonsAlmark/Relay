@@ -120,7 +120,7 @@ class RerunSession:
                     dataset=dataset,
                     collection=collection
                 )
-                self._source_catalog_cache = result
+                json.dumps(result, ensure_ascii=False) = result
                 t1 = time.time()
                 logger.debug(f"[{self.recording_uuid}] Source Catalog 初始化完成，耗时 {t1 - t0:.2f}s")
                 
@@ -456,10 +456,12 @@ class RerunSession:
         或者作为一个明确的信号表明“在此之前的数据已作废”。
         """
         try:
-            # 记录一个空的 TextLog 作为标记，确保时间轴更新
-            self.stream.set_time("frame_idx", sequence=frame_idx)
-            self.stream.log("internal/sentinel", rr.TextLog(f"Sentinel Frame: {frame_idx}"))
-            logger.info(f"[{self.recording_uuid}] Sent sentinel frame at {frame_idx}")
+            self.stream.set_time("frame_idx", sequence=0)
+            self.stream.log("internal/range_marker", rr.TextLog("Start"))
+            self.stream.set_time("frame_idx", sequence=self.max_frame_idx - 1)
+            self.stream.log("internal/range_marker", rr.TextLog("End"))
+            self.stream.set_time("frame_idx", sequence=0)
+            self.stream.log("meta/source_catalog", rr.TextDocument(json.dumps(json.dumps(result, ensure_ascii=False), ensure_ascii=False), media_type="text/json"))
         except Exception as e:
             logger.error(f"[{self.recording_uuid}] Failed to send sentinel frame: {e}")
 
