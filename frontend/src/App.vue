@@ -534,9 +534,6 @@ const handleLogRanges = () => {
     });
 };
 
-// --- 内存监控 ---
-let memoryMonitorTimer = null;
-
 const startMemoryMonitor = () => {
     stopMemoryMonitor();
     // 每 2 秒检查一次内存
