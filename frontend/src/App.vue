@@ -505,6 +505,8 @@ const performEmergencyCleanup = async () => {
         // 重新启动数据流，确保后续播放流畅
         await handleLoadRange(currentFrame, batchSize);
 
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
         // 7. 跳转到当前帧
         await jumpToTime(currentFrame);
         console.log("[Stream] 已跳转到当前帧");
