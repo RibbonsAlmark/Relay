@@ -65,13 +65,34 @@
       :source="currentSource" 
     />
 
+    <!-- :on-reload="handleManualReload" -->
     <FloatingButton 
       :on-reload="handleManualReload"
       @drag-start="isDragging = true"
       @drag-end="isDragging = false"
     />
+
+    <div v-if="isDebugMode" class="debug-panel">
+      <span class="memory-tag" title="Rerun WASM 内存占用">🧠 {{ memoryUsage }} MB</span>
+      <button @click="handleCacheCleanup(20)" title="保留当前帧前后20帧，删除其余数据">✂️ 裁剪(±20)</button>
+      <button @click="handleDebugForceGC" title="强制触发 WASM 垃圾回收">🧹 强制GC</button>
+      <button @click="handleLogRanges" title="打印当前有效帧范围">📋 帧范围</button>
+      <button @click="handleDebugSentinel" title="发送哨兵帧请求">🛡️ 哨兵帧</button>
+    </div>
   </div>
 </template>
+
+<style>
+/* 简单补充一下样式，让显示更美观 */
+.memory-tag {
+  color: #4caf50;
+  font-weight: bold;
+  margin-right: 10px;
+  background: rgba(0,0,0,0.3);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+</style>
 
 <script setup>
 import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
@@ -99,7 +120,11 @@ const pendingRanges = ref(new Set()); // 记录正在加载中的区间字符串
 const maxFrameIdx = ref(0); // 数据集最大帧数
 const currentPlaybackFrame = ref(0); // 当前播放帧索引
 const isDragging = ref(false); // 控制 iframe 穿透
+const isCleaningUp = ref(false); // 控制紧急清理状态
+const memoryUsage = ref(0); // Rerun 内存使用量 (MB)
 
+// 仅在开发模式下显示调试面板
+const isDebugMode = import.meta.env.DEV;
 
 // 直接在 setup 顶层运行，不要等到 onMounted
 const params = new URLSearchParams(window.location.search);
@@ -189,7 +214,50 @@ watch(recordingUuid, (newId) => {
 });
 
 // --- 全局消息监听处理 ---
+const handleRerunMessage = (event) => {
+  const data = event.data;
+  // console.log("[Rerun Message]", data);
+  // 过滤消息，只处理 rerun_memory_usage 类型
+  if (data && data.type === 'rerun_memory_usage') {
+    const usageBytes = data.usage;
+    // 转换为 MB
+    const usageMB = (usageBytes / 1024 / 1024).toFixed(2);
+    memoryUsage.value = usageMB;
+    // console.log("[Stream] Rerun 内存使用量:", usageMB, "MB");
+
+    // --- 自动 GC 触发逻辑 ---
+    // 如果内存超过阈值，且当前没有正在执行清理
+    if (usageMB > RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB && !isCleaningUp.value) {
+      console.warn(`[AutoGC] 内存占用 (${usageMB} MB) 超过阈值 (${RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB} MB)，触发紧急清理...`);
+      performEmergencyCleanup();
+    }
+  }
+};
+
+onMounted(() => {
+  window.addEventListener('message', handleRerunMessage);
+});
+
+onUnmounted(() => {
+  stopHeartbeatLoop();
+  window.removeEventListener('message', handleRerunMessage);
+});
 const handleGlobalMessage = async (event) => {
+  // 监听 Rerun 内存报告 (用户自定义接口)
+  if (event.data?.type === "rerun_memory_report") {
+      const memoryUsageBytes = event.data.usageBytes;
+      const memoryUsedMB = memoryUsageBytes / (1024 * 1024);
+      const MEMORY_LIMIT = RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB || 1500;
+
+      console.log(`[Stream] Rerun 内存报告: ${memoryUsedMB.toFixed(1)} MB`);
+
+      if (memoryUsedMB > MEMORY_LIMIT) {
+          console.warn(`[Stream] Rerun 内存超标 (${memoryUsedMB.toFixed(1)}MB > ${MEMORY_LIMIT}MB), 触发紧急清理流程...`);
+          await performEmergencyCleanup();
+      }
+      return;
+  }
+
   // 监听打分完成消息
   if (event.data?.type === "RERUN_RATING_COMPLETE") {
     console.log("收到打分完成消息:", event.data);
@@ -234,7 +302,7 @@ const handleGlobalMessage = async (event) => {
   }
 };
 
-// 页面初始化：加载后端数据库结构
+// 页面初始化
 onMounted(async () => {
   // 注册全局消息监听
   window.addEventListener('message', handleGlobalMessage);
@@ -323,6 +391,9 @@ onMounted(async () => {
         
         // 强制跳转到第0帧，确保播放器指针归位
         jumpToTime("frame_idx", 0);
+
+        // [新增] 启动内存监控
+        startMemoryMonitor();
     } else {
         // 经典模式：一次性全量加载
         await handlePlayData(); 
@@ -332,6 +403,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopHeartbeatLoop();
+  stopMemoryMonitor();
   window.removeEventListener('message', handleGlobalMessage);
 });
 
@@ -350,6 +422,11 @@ const waitForRerunReady = () => {
         // 2. 监听时间轴更新信号
         if (data && data.type === "rerun_time_update") { 
             onTimeUpdate(data);
+        }
+        
+        // [新增] 监听行数报告
+        if (data && data.type === "rerun_row_count_report") {
+             console.log(`[Stream] Rerun 内存行数报告: ${data.count}`);
         }
     }); 
   });
@@ -396,65 +473,271 @@ const callRerunDrop = (start, end) => {
     }
 };
 
-// --- 缓存清理逻辑 (基于距离的最远驱逐策略) ---
-const handleCacheCleanup = () => {
+// [新增] 显式触发 Rerun GC
+const callRerunForceGC = () => {
+    // 由于 Rerun Viewer 运行在 iframe 中，且 force_gc 是 WASM 句柄上的方法
+    // 我们无法直接从父页面调用 iframe 内部的 WASM 对象 (跨域隔离/封装)
+    // 因此，我们需要发送一个特殊的消息给 iframe，由 iframe 内部的 JS 监听并调用 WASM
+    // 假设 Rerun Viewer 的 HTML 宿主代码已经集成了监听 "rerun_force_gc" 消息的逻辑
+    const win = getRerunWindow();
+    if (win) {
+        console.log("[Stream] 发送 GC 指令...");
+
+        // 根据用户指示：postMessage 接口只支持传入一个保护区间
+        // 选取当前帧所在的节点窗口为保护帧范围（即当前帧及向前[保护半径]帧）
+        const currentFrame = Math.max(0, Math.floor(currentPlaybackFrame.value || 0));
+        const radius = RERUN_CONFIG.STREAMING_SAFE_WINDOW_RADIUS || 500;
+
+        const protectedMap = {
+            "frame_idx": { // 直接传对象，不要用数组
+                min: BigInt(currentFrame),
+                max: BigInt(currentFrame + radius)
+            }
+        };
+
+        win.postMessage({
+            type: "rerun_force_gc_everything",
+            protected_time_ranges: protectedMap
+        }, "*");
+    }
+};
+
+// [新增] 请求 Rerun 报告行数 (用于验证)
+const requestRerunRowCount = () => {
+    const win = getRerunWindow();
+    if (win) {
+        win.postMessage({
+            type: "rerun_get_row_count"
+        }, "*");
+    }
+};
+
+// [新增] 调试用的哨兵帧按钮处理
+const handleDebugSentinel = async () => {
+    if (!recordingUuid.value) return;
+    const currentFrame = Math.max(0, Math.floor(currentPlaybackFrame.value || 0));
+    console.log(`[Debug] 手动触发哨兵帧请求: frame=${currentFrame}`);
+    try {
+        await fetch(API_ENDPOINTS.SEND_SENTINEL(recordingUuid.value) + `?frame_idx=${currentFrame}`, { method: 'POST' });
+        ElNotification({
+            title: '调试',
+            message: `已发送哨兵帧 (Frame ${currentFrame})`,
+            type: 'success',
+            duration: 2000
+        });
+    } catch (e) {
+        console.error("[Debug] 发送哨兵帧失败:", e);
+        ElNotification({
+            title: '调试失败',
+            message: '发送哨兵帧请求失败',
+            type: 'error',
+            duration: 2000
+        });
+    }
+};
+
+// [新增] 调试用的强制 GC 按钮处理
+const handleDebugForceGC = async () => {
+    console.log("[Debug] 手动触发强制 GC (执行完整清理流程)");
+    await performEmergencyCleanup();
+    requestRerunRowCount();
+    ElNotification({
+        title: '调试',
+        message: '已执行完整清理流程',
+        type: 'success',
+        duration: 2000
+    });
+};
+
+// [新增] 执行紧急清理流程 (封装通用逻辑)
+const performEmergencyCleanup = async () => {
+    if (isCleaningUp.value) return; // 防止重入
+    isCleaningUp.value = true;
+
+    console.warn(`[Stream] 执行紧急清理流程...`);
+
+    try {
+        // 1. 记录当前帧序号
+        const currentFrame = Math.max(0, Math.floor(currentPlaybackFrame.value || 0));
+        const radius = RERUN_CONFIG.STREAMING_SAFE_WINDOW_RADIUS || 500;
+
+        // 2. 暂停触发数据请求 (通过 isCleaningUp 标志位控制)
+        // 同时清空前端的 pending 队列，避免旧请求回来后干扰状态
+        pendingRanges.value.clear();
+
+        // 3. 发送清空发送队列请求
+        await fetch(API_ENDPOINTS.CLEAR_QUEUES(recordingUuid.value), { method: 'POST' });
+        console.log("[Stream] 后端发送队列已清空");
+
+        // 4. 触发强制 GC (callRerunForceGC 内部会保护 [current, current+radius])
+        callRerunForceGC();
+
+        // [Fix] 给 Rerun Viewer 一点时间处理 GC 消息，防止哨兵帧请求在 Viewer 繁忙/冻结时被丢弃或忽略
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // [Updated] GC 后状态重置逻辑
+        // 1. 清空当前有效帧列表
+        loadedRanges.value = [];
+        
+        // 2. (逻辑上) 哨兵帧通常对应当前帧 [currentFrame, currentFrame + 1]
+        // 3. (逻辑上) 后续加载的 N 帧 [currentFrame, currentFrame + batchSize]
+        // 实际上这两个区间是重叠的，我们直接合并为一个连续区间
+        const batchSize = RERUN_CONFIG.STREAMING_BATCH_SIZE;
+        let safeEnd = currentFrame + batchSize;
+        if (maxFrameIdx.value > 0 && safeEnd > maxFrameIdx.value) {
+            safeEnd = maxFrameIdx.value;
+        }
+        
+        // 更新 loadedRanges
+        loadedRanges.value.push([currentFrame, safeEnd]);
+        console.log(`[Stream] GC后状态重置: loadedRanges=[[${currentFrame}, ${safeEnd}]]`);
+
+        // 5. 请求哨兵帧
+        await fetch(API_ENDPOINTS.SEND_SENTINEL(recordingUuid.value) + `?frame_idx=${currentFrame}`, { method: 'POST' });
+        console.log("[Stream] 哨兵帧已发送");
+
+        // 6. 向后请求数据
+        // 重新启动数据流，确保后续播放流畅
+        await handleLoadRange(currentFrame, batchSize);
+
+        // 7. 跳转到当前帧
+        await jumpToTime(currentFrame);
+        console.log("[Stream] 已跳转到当前帧");
+        
+    } catch (e) {
+        console.error("[Stream] 紧急清理流程异常:", e);
+    } finally {
+        isCleaningUp.value = false;
+    }
+};
+
+// [新增] 打印当前有效帧范围
+const handleLogRanges = () => {
+    console.log("[Debug] 当前有效帧范围 (loadedRanges):", JSON.parse(JSON.stringify(loadedRanges.value)));
     let totalCached = 0;
     for (const range of loadedRanges.value) {
         totalCached += (range[1] - range[0]);
     }
+    console.log(`[Debug] 总缓存帧数: ${totalCached}`);
+    ElNotification({
+        title: '调试信息',
+        message: `当前缓存 ${totalCached} 帧，详情请看控制台`,
+        type: 'info',
+        duration: 2000
+    });
+};
+
+// --- 内存监控 ---
+let memoryMonitorTimer = null;
+
+const startMemoryMonitor = () => {
+    stopMemoryMonitor();
+    // 每 2 秒检查一次内存
+    memoryMonitorTimer = setInterval(checkMemoryUsage, 2000);
+    console.log("[Stream] 内存监控已启动");
+};
+
+const stopMemoryMonitor = () => {
+    if (memoryMonitorTimer) {
+        clearInterval(memoryMonitorTimer);
+        memoryMonitorTimer = null;
+    }
+};
+
+const requestRerunMemory = () => {
+    const win = getRerunWindow();
+    if (win) {
+        win.postMessage({
+            type: "rerun_get_memory_usage"
+        }, "*");
+    }
+    // console.log("[Stream] 内存查询请求已发送");
+};
+
+const checkMemoryUsage = async () => {
+    // 如果正在清理中，跳过检查
+    if (isCleaningUp.value) return;
+
+    // 向 Rerun Viewer 发起内存查询请求
+    // 实际的清理逻辑将在 handleGlobalMessage 的 rerun_memory_report 分支中触发
+    requestRerunMemory();
+};
+
+// --- 缓存清理逻辑 (基于内存压力的动态窗口策略) ---
+// forceRadius: 如果传入数字，则忽略内存检查，强制使用该半径进行裁剪
+const handleCacheCleanup = async (forceRadius = null) => {
+    // 1. 检查内存使用情况 (仅 Chrome/Edge 支持 performance.memory)
+    // 注意：内存超标检查已移至独立监控 (checkMemoryUsage)
+    // 此处主要处理 forceRadius 带来的手动裁剪，或者保留原有的窗口裁剪逻辑作为辅助
     
-    const MAX_CACHED = RERUN_CONFIG.STREAMING_MAX_CACHED_FRAMES || 1000;
-    if (totalCached <= MAX_CACHED) return;
+    // 计算当前总缓存帧数
+    let totalCached = 0;
+    for (const range of loadedRanges.value) {
+        totalCached += (range[1] - range[0]);
+    }
+
+    // 2. 决定是否触发清理
+    let shouldCleanup = false;
+    let windowRadius = 0;
+
+    if (forceRadius !== null) {
+        // 调试模式：强制清理
+        shouldCleanup = true;
+        windowRadius = forceRadius;
+        console.warn(`[Stream] 调试触发强制清理: Radius=${windowRadius}`);
+    } 
     
-    console.log(`[Stream] 缓存超标 (${totalCached} > ${MAX_CACHED})，执行窗口清理策略...`);
+    // 如果既不是强制清理，内存监控也会负责紧急清理，这里可以只做常规维护
+    // 但如果用户希望在内存没满但 range 太长时也修剪一下，可以保留逻辑。
+    // 不过按照指令 "直接添加对内存用量的监听，达到阈值直接触发performEmergencyCleanup"，
+    // 这里的内存检查可以移除了。
+    
+    if (!shouldCleanup) return;
+    
+    // [调试] 清理前记录行数
+    requestRerunRowCount();
     
     const currentFrame = currentPlaybackFrame.value;
-    // 动态计算窗口大小：BatchSize * 系数
-    const BATCH_SIZE = RERUN_CONFIG.STREAMING_BATCH_SIZE || 100;
-    const RATIO = RERUN_CONFIG.STREAMING_KEEP_WINDOW_RATIO || 5.0;
-    const KEEP_WINDOW = Math.ceil(BATCH_SIZE * RATIO);
-    
-    const halfWindow = Math.floor(KEEP_WINDOW / 2);
+    const SAFE_WINDOW_RADIUS = windowRadius;
     
     // 计算保留窗口范围 [keepStart, keepEnd]
-    const keepStart = Math.max(0, currentFrame - halfWindow);
-    const keepEnd = currentFrame + halfWindow;
+    // 策略修改：只保留当前播放点往后的数据 (和极少量的回头缓冲)
+    // keepStart = currentFrame - 小缓冲 (例如 10 帧，防止手滑拖动时立刻黑屏)
+    // keepEnd = currentFrame + SAFE_WINDOW_RADIUS
+    const keepStart = Math.max(0, currentFrame - 10);
+    const keepEnd = currentFrame + SAFE_WINDOW_RADIUS;
 
     let newRanges = [];
+    let hasDropped = false;
 
-    // 简单窗口保留策略：遍历所有区间，只保留在窗口内的部分
+    // 遍历所有区间，只保留在窗口内的部分
     for (const range of loadedRanges.value) {
         let [start, end] = range;
         
         // 标记该区间是否原本包含第0帧
         const originallyContainsFirstFrame = (start === 0);
-        // 标记该区间是否原本包含最后一帧 (注意: maxFrameIdx 是开区间上限，所以有效帧是 maxFrameIdx-1)
-        // 但这里 range 是 [start, end)，如果 end == maxFrameIdx.value，说明包含了最后一帧
-        const originallyContainsLastFrame = (maxFrameIdx.value > 0 && end === maxFrameIdx.value);
+        // 标记该区间是否原本包含最后一帧
+        // 关键修复: 确保类型一致 (Number) 且使用 >= 容错
+        const maxFrame = Number(maxFrameIdx.value);
+        const originallyContainsLastFrame = (maxFrame > 0 && end >= maxFrame);
         
         // 1. 裁剪头部：[start, keepStart)
         if (start < keepStart) {
             let dropEnd = Math.min(end, keepStart);
             
-            // 关键修复：如果本来包含第0帧，那么绝对不能删掉 [0, 1]
-            // 我们把删除范围限制在 [1, keepStart)
+            // 保护第0帧 [0, 1]
             if (originallyContainsFirstFrame) {
-                 // 如果 dropEnd <= 1，说明整个删除请求都在保护区内，直接取消删除
-                 if (dropEnd <= 1) {
-                     // do nothing
-                 } else {
-                     // 否则，从 1 开始删
+                 if (dropEnd > 1) {
+                     // 删掉 [1, dropEnd)
                      callRerunDrop(1, dropEnd);
-                     // 此时 start 逻辑上变为了 dropEnd，但我们还需要保留 [0, 1]
-                     // 这里为了简单，我们先把 start 移到 dropEnd，
-                     // 然后单独把 [0, 1] 加回 newRanges (如果不连续的话)
                      start = dropEnd;
+                     hasDropped = true;
                  }
             } else {
-                // 普通情况，照常删除
                 if (start < dropEnd) {
                     callRerunDrop(start, dropEnd);
                     start = dropEnd;
+                    hasDropped = true;
                 }
             }
         }
@@ -463,24 +746,30 @@ const handleCacheCleanup = () => {
         if (end > keepEnd) {
             const dropStart = Math.max(start, keepEnd);
             
-            // 关键修复：如果本来包含最后一帧，那么绝对不能删掉 [maxFrameIdx-1, maxFrameIdx]
+            // 保护最后一帧 [max-1, max]
             if (originallyContainsLastFrame) {
-                // 保护区是 [maxFrameIdx-1, maxFrameIdx]
-                const protectedStart = maxFrameIdx.value - 1;
+                const protectedStart = maxFrame - 1;
+                // 只有当删除范围确实会覆盖到保护帧时，才限制删除
+                // 修正：只要 dropStart 小于 maxFrame，就有可能误删
+                // 我们必须保证 drop 范围不能触碰 [protectedStart, maxFrame]
                 
-                // 如果 dropStart >= protectedStart，说明删除请求全在保护区内（或之后），直接取消删除
-                if (dropStart >= protectedStart) {
-                    // do nothing
-                } else {
-                    // 否则，删到 protectedStart 为止: [dropStart, protectedStart)
-                    // 也就是保留了 [protectedStart, end)
+                // 如果建议的删除起点在保护区之前
+                if (dropStart < protectedStart) {
+                    // 安全删除范围是 [dropStart, protectedStart)
                     callRerunDrop(dropStart, protectedStart);
-                    end = dropStart; // 逻辑上 end 变为了 dropStart
+                    // 更新 end 为 protectedStart，意味着保留了 [protectedStart, end] 即 [protectedStart, maxFrame]
+                    end = protectedStart;
+                    hasDropped = true;
+                } else {
+                    // 如果建议的删除起点已经在保护区内（或之后），则完全不删
+                    // 例如 dropStart=4473, protectedStart=4473 -> 不删
+                    // 这样就保护了尾部
                 }
             } else {
                 if (dropStart < end) {
                     callRerunDrop(dropStart, end);
                     end = dropStart;
+                    hasDropped = true;
                 }
             }
         }
@@ -490,32 +779,55 @@ const handleCacheCleanup = () => {
             newRanges.push([start, end]);
         }
         
-        // 4. 补回第0帧 (如果之前因为窗口原因没包含进去)
-        if (originallyContainsFirstFrame) {
-            // 检查 newRanges 里有没有 [0, 1] 或者覆盖了 0 的区间
-            // 由于上面 start 可能被移到了 keepStart (比如 500)，所以 [0, 1] 肯定不在 newRanges 的当前 push 里
-            // 我们需要手动加回去
-            // 只有当当前的 start > 1 时才需要加，因为如果 start 还是 0 (说明窗口覆盖了头部)，那已经加进去了
-            if (start > 1) {
-                newRanges.push([0, 1]);
-            }
+        // 4. 补回第0帧
+        // 修正: 当 start 被裁剪到 > 0 时（哪怕是 1），也需要补回 [0, 1]，否则 [0, 1] 就会丢失
+        if (originallyContainsFirstFrame && start > 0) {
+            console.log(`[Stream] 触发首帧保护: 恢复 [0, 1)`);
+            newRanges.push([0, 1]);
         }
 
-        // 5. 补回最后一帧 (如果之前因为窗口原因没包含进去)
+        // 5. 补回最后一帧
         if (originallyContainsLastFrame) {
-             const lastFrameStart = maxFrameIdx.value - 1;
-             // 如果当前的 end 被裁剪到了 lastFrameStart 之前 (或者等于)，说明最后一帧被切掉了
-             // 我们需要手动加回去 [lastFrameStart, maxFrameIdx]
+             const lastFrameStart = maxFrame - 1;
+             // 检查当前 range 是否还包含尾帧
+             // 如果 end 被裁剪到了 protectedStart (maxFrame-1) 或更小，说明尾帧部分不在当前的 [start, end) 里了
+             // (因为上面步骤2里，如果原本包含尾帧，我们强制把 end 设为了 protectedStart，保留下来的区间变成了 [start, protectedStart])
+             // 等等，这里的逻辑有点绕。
+             // 如果步骤2保护生效，end 变成了 protectedStart。那么 [start, end) 确实不包含尾帧了。
+             // 所以这里必须补回 [protectedStart, maxFrame]。
+             
+             // 之前的逻辑：if (end <= lastFrameStart)
+             // 如果保护生效，end === lastFrameStart，满足条件 -> 补回。
+             // 如果保护没生效（比如原本就不包含尾帧），则 originallyContainsLastFrame 为 false，不进这里。
+             // 如果原本包含尾帧，且 keepEnd 很大，涵盖了尾帧 -> end 没变 (maxFrame) -> end > lastFrameStart -> 不进这里 -> [start, maxFrame] 被加入 newRanges -> 尾帧在 newRanges 里。
+             
+             // 综上，逻辑似乎是对的。但为了保险，我们显式判断：
+             // 只要 originallyContainsLastFrame 为真，我们就要确保 newRanges 里有 [lastFrameStart, maxFrame]
+             // 我们可以简单粗暴地把 [lastFrameStart, maxFrame] 作为一个独立的区间 push 进去
+             // 然后让后续的 sort 和 merge 去处理（但这里没有 merge 步骤，只是 sort）
+             // 所以还是得小心。
+             
              if (end <= lastFrameStart) {
-                 newRanges.push([lastFrameStart, maxFrameIdx.value]);
+                 console.log(`[Stream] 触发尾帧保护: 恢复 [${lastFrameStart}, ${maxFrame})`);
+                 newRanges.push([lastFrameStart, maxFrame]);
              }
         }
     }
     
-    // 重新排序，因为补回的首尾帧可能会打乱顺序
     newRanges.sort((a, b) => a[0] - b[0]);
-    
     loadedRanges.value = newRanges;
+    
+    // [新增] 触发显式 GC
+    // 只有在真正发生了 drop 操作时才触发 GC，避免无效调用
+    if (hasDropped) {
+        console.log("[Stream] 触发显式 GC (因数据裁剪)");
+        callRerunForceGC();
+    } else {
+        // console.log("[Stream] 无数据裁剪，跳过 GC");
+    }
+    
+    // [调试] 请求行数报告，验证清理效果
+    requestRerunRowCount();
 };
 
 const handleLoadRange = async (startIndex, count) => {
@@ -523,7 +835,7 @@ const handleLoadRange = async (startIndex, count) => {
   
   // 越界检查
   if (maxFrameIdx.value > 0 && startIndex >= maxFrameIdx.value) {
-      console.log(`[Stream] 请求起始点 ${startIndex} 超出最大帧数 ${maxFrameIdx.value}，停止加载`);
+      // console.log(`[Stream] 请求起始点 ${startIndex} 超出最大帧数 ${maxFrameIdx.value}，停止加载`);
       return;
   }
   
@@ -532,7 +844,7 @@ const handleLoadRange = async (startIndex, count) => {
   // 截断 EndIndex
   if (maxFrameIdx.value > 0 && endIndex > maxFrameIdx.value) {
       endIndex = maxFrameIdx.value;
-      console.log(`[Stream] 截断加载范围至末尾: ${endIndex}`);
+      // console.log(`[Stream] 截断加载范围至末尾: ${endIndex}`);
   }
   
   // 检查是否与正在进行的请求重叠
@@ -615,19 +927,32 @@ const onTimeUpdate = (data) => {
     // 更新全局状态，供清理逻辑使用
     currentPlaybackFrame.value = currentFrameIdx;
 
+    // console.log(`[StreamDebug] TimeUpdate: frame=${currentFrameIdx}, playing=${isPlaying}`);
+
     if (isPlaying) {
-      handleStreamingPlayback(currentFrameIdx);
+      handleStreamingPlayback(currentFrameIdx, true);
     } else {
+      // 即使暂停了，也要检查是否是因为缺数据导致的暂停
+      // 如果当前帧处于已加载区间的末尾，且后面还有数据未加载，则尝试加载
+      handleStreamingPlayback(currentFrameIdx, false);
       handleStreamingJump(currentFrameIdx);
     }
 };
 
-// 场景 1: 正常播放中的流式加载
-const handleStreamingPlayback = (currentFrameIdx) => {
+// 场景 1: 正常播放中的流式加载 (也包括暂停时的缺数据检查)
+const handleStreamingPlayback = (currentFrameIdx, isRerunPlaying = false) => {
+    // 如果正在进行紧急清理，暂停一切数据请求
+    if (isCleaningUp.value) return;
+
+    // 0. 如果已经到达整个数据集的末尾，则不再请求
+    // 注意 maxFrameIdx 是开区间上限，所以有效最大帧是 maxFrameIdx - 1
+    if (maxFrameIdx.value > 0 && currentFrameIdx >= maxFrameIdx.value - 1) {
+        return;
+    }
+
     // 策略：不再只看最后一个区间，而是关注“当前播放区间”的剩余量
-    // if (loadedRanges.value.length === 0) return;
-    
-    const BUFFER_THRESHOLD = RERUN_CONFIG.STREAMING_BUFFER_THRESHOLD || 50;
+    // 动态阈值：暂停时使用更大的阈值，以便在"数据不足导致暂停"的情况下能触发加载
+    const BUFFER_THRESHOLD = RERUN_CONFIG.getStreamingThreshold(isRerunPlaying);
     
     // 1. 找到包含当前帧的区间
     let activeRangeIndex = -1;
@@ -643,9 +968,12 @@ const handleStreamingPlayback = (currentFrameIdx) => {
         // 我们在某个区间内
         const currentRange = loadedRanges.value[activeRangeIndex];
         const currentRangeEnd = currentRange[1];
+        const remaining = currentRangeEnd - currentFrameIdx;
         
+        // console.log(`[StreamDebug] InRange: [${currentRange}], remaining=${remaining}, threshold=${BUFFER_THRESHOLD}`);
+
         // 检查是否接近当前区间的末尾
-        if (currentRangeEnd - currentFrameIdx < BUFFER_THRESHOLD) {
+        if (remaining < BUFFER_THRESHOLD) {
             // 准备加载的位置是当前区间的末尾
             const loadStart = currentRangeEnd;
             
@@ -678,16 +1006,21 @@ const handleStreamingPlayback = (currentFrameIdx) => {
                     if (gapSize < loadCount) {
                         loadCount = gapSize;
                     }
+                    console.log(`[StreamDebug] Gap detected: size=${gapSize}, triggering load [${loadStart}, ${loadStart + loadCount})`);
                     // 触发加载
                     handleLoadRange(loadStart, loadCount);
+                } else {
+                    // console.log(`[StreamDebug] Continuous data (next=${nextRange[0]}), no load needed`);
                 }
                 // 如果没有空隙 (loadStart == nextRange[0])，说明数据连续，无需加载，自然播放过去即可
-            } else {
+            } else if(loadStart != maxFrameIdx.value - 1)  {
+                console.log(`[StreamDebug] End of range, no next range. Triggering load [${loadStart}, ${loadStart + loadCount})`);
                 // 后面没有区间了，正常往后加载
                 handleLoadRange(loadStart, loadCount);
             }
         }
     } else {
+        console.log(`[StreamDebug] Out of range: frame=${currentFrameIdx}, triggering immediate load`);
         // 当前帧不在任何已加载区间内
         // 这通常发生在播放指针刚跳出区间，或者处于空隙中
         // 尝试立即加载当前位置
@@ -705,7 +1038,7 @@ const handleStreamingJump = (currentFrameIdx) => {
     );
     
     if (!isCovered) {
-        console.log(`[Stream] 检测到跳转至未加载区域: ${currentFrameIdx}`);
+        // console.log(`[Stream] 检测到跳转至未加载区域: ${currentFrameIdx}`);
         // 从跳转点开始加载
         handleLoadRange(currentFrameIdx, RERUN_CONFIG.STREAMING_BATCH_SIZE);
     }
@@ -798,6 +1131,15 @@ const handleManualReload = () => {
   console.log(`[Manual Reload] 用户手动触发加载: Start=${startFrame}, Count=${count}`);
   
   handleLoadRange(startFrame, count);
+
+  // [新增] 显式把手动重载的范围标记为有效
+  // 这样可以防止 UI 认为这里没数据而反复触发自动加载
+  let endFrame = startFrame + count;
+  if (maxFrameIdx.value > 0 && endFrame > maxFrameIdx.value) {
+    endFrame = maxFrameIdx.value;
+  }
+  loadedRanges.value.push([startFrame, endFrame]);
+  console.log(`[Manual Reload] 已手动添加有效帧范围: [${startFrame}, ${endFrame}]`);
   
   ElNotification({
     title: '重新加载',
@@ -806,6 +1148,32 @@ const handleManualReload = () => {
     position: 'bottom-left',
     duration: 2000
   });
+
+  fetch(API_ENDPOINTS.SEND_SENTINEL(recordingUuid.value) + `?frame_idx=${startFrame}`, { method: 'POST' });
+  console.log("[Stream] 哨兵帧已发送");
+};
+
+// 临时调试：输出状态
+const handleDebugDump = () => {
+    console.group("=== Rerun State Dump ===");
+    console.log("loadedRanges:", JSON.parse(JSON.stringify(loadedRanges.value)));
+    console.log("pendingRanges:", [...pendingRanges.value]);
+    console.log("currentPlaybackFrame:", currentPlaybackFrame.value);
+    
+    // Check if current frame is being loaded
+    const isLoadingCurrent = [...pendingRanges.value].some(range => {
+        const [start, end] = range.split('-').map(Number);
+        return currentPlaybackFrame.value >= start && currentPlaybackFrame.value < end;
+    });
+    console.log("isLoadingCurrentFrame:", isLoadingCurrent);
+    
+    console.log("maxFrameIdx:", maxFrameIdx.value);
+    console.log("isPlaying:", playing.value); // Added isPlaying state
+    
+    // [调试] 手动触发一次行数检查
+    requestRerunRowCount();
+    
+    console.groupEnd();
 };
 </script>
 
@@ -874,5 +1242,30 @@ input:disabled { opacity: 0.4; cursor: not-allowed; }
 /* 关键修复：拖拽时禁用 iframe 响应，防止鼠标事件被吞噬 */
 .is-dragging :deep(iframe) {
   pointer-events: none;
+}
+
+.debug-panel {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 8px;
+  z-index: 9999;
+}
+
+.debug-panel button {
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  border: 1px solid #555;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.2s;
+}
+
+.debug-panel button:hover {
+  background: rgba(0, 0, 0, 0.8);
+  border-color: #777;
 }
 </style>
