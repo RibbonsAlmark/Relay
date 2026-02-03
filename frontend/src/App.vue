@@ -172,7 +172,7 @@ const startHeartbeatLoop = () => {
 
 // --- 停止心跳循环 ---
 const stopHeartbeatLoop = () => {
-  if (heartbeatTimer) {
+  if (heartbeatTimer) {let memoryMonitorTimer = null;
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
   }
@@ -190,47 +190,32 @@ watch(recordingUuid, (newId) => {
 });
 
 // --- Logic: Iframe Communication ---
-const handleRerunMessage = (event) => {
-  const data = event.data;
-  
+const handleRerunMessage = (data) => {
+ 
   // 处理内存报告
-  if (data && data.type === 'rerun_memory_usage') {
-    const usageBytes = data.usage;
-    const usageMB = (usageBytes / 1024 / 1024).toFixed(2);
-    memoryUsage.value = usageMB;
 
-    // [Auto GC] 如果内存超过阈值，且当前未在清理，触发紧急清理
-    if (usageMB > RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB && !isCleaningUp.value) {
-      console.warn(`[AutoGC] 内存占用 (${usageMB} MB) > 阈值，触发清理...`);
-      performEmergencyCleanup();
-    }
+  const usageBytes = data.usage;
+  const usageMB = (usageBytes / 1024 / 1024).toFixed(2);
+  memoryUsage.value = usageMB;
+
+  // [Auto GC] 如果内存超过阈值，且当前未在清理，触发紧急清理
+  if (usageMB > RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB && !isCleaningUp.value) {
+    console.warn(`[AutoGC] 内存占用 (${usageMB} MB) > 阈值，触发清理...`);
+    performEmergencyCleanup();
   }
 };
-
-onMounted(() => {
-  window.addEventListener('message', handleRerunMessage);
-  // 注册全局消息监听 (Rating, Ready, etc.)
-  window.addEventListener('message', handleGlobalMessage);
-});
 
 onUnmounted(() => {
   stopHeartbeatLoop();
   stopMemoryMonitor();
-  window.removeEventListener('message', handleRerunMessage);
+  // window.removeEventListener('message', handleRerunMessage);
   window.removeEventListener('message', handleGlobalMessage);
 });
 
 const handleGlobalMessage = async (event) => {
   // 1. 监听自定义内存报告 (Legacy support if needed)
-  if (event.data?.type === "rerun_memory_report") {
-      const memoryUsedMB = event.data.usageBytes / (1024 * 1024);
-      const MEMORY_LIMIT = RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB || 1500;
-
-      if (memoryUsedMB > MEMORY_LIMIT) {
-          console.warn(`[Stream] 内存超标 (${memoryUsedMB.toFixed(1)}MB), 触发清理...`);
-          await performEmergencyCleanup();
-      }
-      return;
+  if (event.data?.type === "rerun_memory_usage") {
+      handleRerunMessage(event.data);
   }
 
   // 2. 监听打分完成消息
@@ -261,6 +246,9 @@ const handleGlobalMessage = async (event) => {
 
 // --- Lifecycle: Main Initialization ---
 onMounted(async () => {
+  // 注册全局消息监听 (Rating, Ready, etc.)
+  window.addEventListener('message', handleGlobalMessage);
+
   // 1. 解析 URL 参数
   const params = new URLSearchParams(window.location.search);
   const urlParam = params.get('rerun_url');
