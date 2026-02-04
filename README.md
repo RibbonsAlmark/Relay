@@ -87,33 +87,41 @@ Relay 采用 **C/S 分离** 架构，前端为基于 **Vue 3** 的单页应用 (
 
 #### **交互时序图 (Message Flow)**
 
-![Sequence Diagram](https://mermaid.ink/img/eyJjb2RlIjogInNlcXVlbmNlRGlhZ3JhbVxuICAgIHBhcnRpY2lwYW50IFJlcnVuIGFzIFJlcnVuIFZpZXdlciAoSWZyYW1lKVxuICAgIHBhcnRpY2lwYW50IFZ1ZSBhcyBBcHAudnVlIChDb250cm9sIFBsYW5lKVxuICAgIFxuICAgIFJlcnVuLT4+VnVlOiByZXJ1bl9yZWFkeVxuICAgIFZ1ZS0+PlZ1ZTogXHU1NDJmXHU1MmE4XHU1MjFkXHU1OWNiXHU1MzE2ICh3YWl0Rm9yUmVydW5SZWFkeSByZXNvbHZlKVxuICAgIFxuICAgIGxvb3AgXHU2NGFkXHU2NTNlL1x1NGVhNFx1NGU5Mlx1NWZhYVx1NzNhZlxuICAgICAgICBSZXJ1bi0+PlZ1ZTogcmVydW5fdGltZV91cGRhdGUgKHRpbWUsIGlzX3BsYXlpbmcpXG4gICAgICAgIFZ1ZS0+PlZ1ZTogXHU4YmExXHU3Yjk3XHU3ZjNhXHU1M2UzXHVmZjBjXHU4OWU2XHU1M2QxIGhhbmRsZVN0cmVhbWluZ1BsYXliYWNrL0p1bXBcbiAgICAgICAgXG4gICAgICAgIFJlcnVuLT4+VnVlOiByZXJ1bl9tZW1vcnlfdXNhZ2UgKHVzYWdlKVxuICAgICAgICBvcHQgXHU1MTg1XHU1YjU4XHU4ZDg1XHU5NjUwXG4gICAgICAgICAgICBWdWUtPj5WdWU6IHBlcmZvcm1FbWVyZ2VuY3lDbGVhbnVwIChcdTg5ZTZcdTUzZDEgR0MpXG4gICAgICAgIGVuZFxuICAgICAgICBcbiAgICAgICAgb3B0IFx1NzUyOFx1NjIzN1x1NzBiOVx1NTFmYlx1NWJmOVx1OGM2MVxuICAgICAgICAgICAgUmVydW4tPj5WdWU6IHJlcnVuX2RhdGFzb3VyY2Vfc2VsZWN0ZWQgKHNvdXJjZV9pZCwgcmFuZ2UpXG4gICAgICAgICAgICBWdWUtPj5WdWU6IGhhbmRsZURhdGFTb3VyY2VTZWxlY3Rpb24gKFx1OTUwMVx1NWI5YVx1NGVhNFx1NGU5Mlx1NmEyMVx1NWYwZlx1ZmYwY1x1OGJiZVx1N2Y2ZSBMb29wKVxuICAgICAgICBlbmRcbiAgICBlbmQiLCAibWVybWFpZCI6IHsidGhlbWUiOiAiZGVmYXVsdCJ9fQ==)
+![Sequence Diagram](https://mermaid.ink/img/eyJjb2RlIjogInNlcXVlbmNlRGlhZ3JhbVxuICAgIHBhcnRpY2lwYW50IERQX1dlYiBhcyBEYXRhIFBsYXRmb3JtPGJyLz4oV2ViIFVJKVxuICAgIHBhcnRpY2lwYW50IFZ1ZSBhcyBBcHAudnVlPGJyLz4oUmVsYXkgRnJvbnRlbmQpXG4gICAgcGFydGljaXBhbnQgUmVydW4gYXMgUmVydW4gVmlld2VyPGJyLz4oSWZyYW1lIC8gV0FTTSlcbiAgICBwYXJ0aWNpcGFudCBSZWxheV9CRSBhcyBSZWxheSBCYWNrZW5kPGJyLz4oRmFzdEFQSSlcbiAgICBwYXJ0aWNpcGFudCBEUF9EQiBhcyBEYXRhIFBsYXRmb3JtPGJyLz4oTW9uZ29EQilcblxuICAgIE5vdGUgb3ZlciBEUF9XZWIsIFJlbGF5X0JFOiAxLiBTZXNzaW9uIEluaXRpYWxpemF0aW9uIFBoYXNlXG4gICAgRFBfV2ViLT4-UmVsYXlfQkU6IFBPU1QgL2NyZWF0ZV9zb3VyY2UgKGRhdGFzZXQsIGNvbGxlY3Rpb24pXG4gICAgUmVsYXlfQkUtPj5SZWxheV9CRTogQ3JlYXRlIFNlc3Npb24sIFN0YXJ0IFJlcnVuIFByb2Nlc3NcbiAgICBSZWxheV9CRS0tPj5EUF9XZWI6IHsgc2Vzc2lvbl9pZCwgY29ubmVjdF91cmwsIG1heF9mcmFtZXMgfVxuICAgIFxuICAgIERQX1dlYi0-PlZ1ZTogT3BlbiBXaW5kb3cgLyBJZnJhbWUgKHVybD9zb3VyY2VfdXVpZD0uLi4mcmVydW5fdXJsPS4uLilcbiAgICBcbiAgICBOb3RlIG92ZXIgVnVlLCBSZXJ1bjogMi4gRnJvbnRlbmQgU3RhcnR1cFxuICAgIFZ1ZS0-PlJlcnVuOiBMb2FkIElmcmFtZSAoY29ubmVjdF91cmwpXG4gICAgUmVydW4tPj5WdWU6IHJlcnVuX3JlYWR5XG4gICAgVnVlLT4-UmVsYXlfQkU6IFBPU1QgL2xvYWRfcmFuZ2UgKEluaXRpYWwgQmF0Y2gpXG4gICAgXG4gICAgTm90ZSBvdmVyIFZ1ZSwgRFBfREI6IDMuIFN0cmVhbWluZyBMb29wXG4gICAgUmVsYXlfQkUtPj5EUF9EQjogRmV0Y2ggUmF3IERhdGFcbiAgICBEUF9EQi0tPj5SZWxheV9CRTogUmV0dXJuIERvY3VtZW50c1xuICAgIFJlbGF5X0JFLT4-UmVydW46IFB1c2ggUlJEIERhdGEgKFdlYlNvY2tldClcbiAgICBSZXJ1bi0-PlZ1ZTogcmVydW5fdGltZV91cGRhdGUgKHRpbWUsIGlzX3BsYXlpbmcpXG4gICAgXG4gICAgTm90ZSBvdmVyIFZ1ZSwgUmVydW46IDQuIFVzZXIgSW50ZXJhY3Rpb25cbiAgICBSZXJ1bi0-PlZ1ZTogcmVydW5fZGF0YXNvdXJjZV9zZWxlY3RlZCAoc291cmNlX2lkLCByYW5nZSlcbiAgICBWdWUtPj5WdWU6IGhhbmRsZURhdGFTb3VyY2VTZWxlY3Rpb25cbiAgICBWdWUtPj5SZWxheV9CRTogUE9TVCAvbG9hZF9yYW5nZSAoVGFyZ2V0ZWQgUmFuZ2UpIiwgIm1lcm1haWQiOiB7InRoZW1lIjogImRlZmF1bHQifX0=)
 
 <details>
 <summary>点击查看 Mermaid 源码</summary>
 
 ```mermaid
 sequenceDiagram
-    participant Rerun as Rerun Viewer (Iframe)
-    participant Vue as App.vue (Control Plane)
+    participant DP_Web as Data Platform<br/>(Web UI)
+    participant Vue as App.vue<br/>(Relay Frontend)
+    participant Rerun as Rerun Viewer<br/>(Iframe / WASM)
+    participant Relay_BE as Relay Backend<br/>(FastAPI)
+    participant DP_DB as Data Platform<br/>(MongoDB)
+
+    Note over DP_Web, Relay_BE: 1. Session Initialization Phase
+    DP_Web->>Relay_BE: POST /create_source (dataset, collection)
+    Relay_BE->>Relay_BE: Create Session, Start Rerun Process
+    Relay_BE-->>DP_Web: { session_id, connect_url, max_frames }
     
+    DP_Web->>Vue: Open Window / Iframe (url?source_uuid=...&rerun_url=...)
+    
+    Note over Vue, Rerun: 2. Frontend Startup
+    Vue->>Rerun: Load Iframe (connect_url)
     Rerun->>Vue: rerun_ready
-    Vue->>Vue: 启动初始化 (waitForRerunReady resolve)
+    Vue->>Relay_BE: POST /load_range (Initial Batch)
     
-    loop 播放/交互循环
-        Rerun->>Vue: rerun_time_update (time, is_playing)
-        Vue->>Vue: 计算缺口，触发 handleStreamingPlayback/Jump
-        
-        Rerun->>Vue: rerun_memory_usage (usage)
-        opt 内存超限
-            Vue->>Vue: performEmergencyCleanup (触发 GC)
-        end
-        
-        opt 用户点击对象
-            Rerun->>Vue: rerun_datasource_selected (source_id, range)
-            Vue->>Vue: handleDataSourceSelection (锁定交互模式，设置 Loop)
-        end
-    end
+    Note over Vue, DP_DB: 3. Streaming Loop
+    Relay_BE->>DP_DB: Fetch Raw Data
+    DP_DB-->>Relay_BE: Return Documents
+    Relay_BE->>Rerun: Push RRD Data (WebSocket)
+    Rerun->>Vue: rerun_time_update (time, is_playing)
+    
+    Note over Vue, Rerun: 4. User Interaction
+    Rerun->>Vue: rerun_datasource_selected (source_id, range)
+    Vue->>Vue: handleDataSourceSelection
+    Vue->>Relay_BE: POST /load_range (Targeted Range)
 ```
 </details>
 
