@@ -111,6 +111,8 @@ const playing = ref(false);
 const isDragging = ref(false); // 控制 iframe 穿透
 const isInitialized = ref(false);
 const isCleaningUp = ref(false); // 控制紧急清理状态
+const isUserInteracting = ref(false); // 用户是否正在交互 (暂停自动加载/GC)
+const selectedSourceRange = ref(null); // 当前用户选中的数据源范围 { start, end }
 const rerunViewerRef = ref(null); // 引用 RerunViewer 组件实例
 
 // --- State: Streaming & Memory ---
@@ -189,8 +191,43 @@ watch(recordingUuid, (newId) => {
   }
 });
 
+// [新增] 检查并恢复自动模式 (当播放超出选中范围时)
+const checkAndRestoreAutoMode = (currentFrame) => {
+    if (!isUserInteracting.value || !selectedSourceRange.value) return;
+
+    const { start, end } = selectedSourceRange.value;
+    // 如果当前帧超出了选中范围 (允许一定的误差 buffer，例如 5 帧)
+    const buffer = 5;
+    if (currentFrame < start - buffer || currentFrame > end + buffer) {
+        console.log(`[Stream] 当前帧 (${currentFrame}) 超出选中范围 [${start}, ${end}]，恢复自动模式`);
+        isUserInteracting.value = false;
+        selectedSourceRange.value = null;
+    }
+};
+
+// [新增] 处理数据源选择逻辑
+const handleDataSourceSelection = async (source_id, start_time, end_time) => {
+    console.log(`[Rerun Selection] Source: ${source_id}, Range: ${start_time} - ${end_time}`);
+      
+    // 1. 发送清空发送队列请求
+    await clearBackendQueues();
+
+    // 2. 设置信号量，暂停到达阈值之后的数据获取触发 + 暂停 GC
+    isUserInteracting.value = true;
+    selectedSourceRange.value = { start: start_time, end: end_time };
+    console.log("[Stream] 用户交互模式已激活 (暂停自动加载与GC)");
+
+    // 3. 获取数据请求 (获取该 source 的范围 + 向右 10 帧)
+    const fetchStart = Math.floor(start_time);
+    const fetchEnd = Math.ceil(end_time);
+    const extraFrames = 10;
+    const count = (fetchEnd - fetchStart) + extraFrames;
+    
+    await handleLoadRange(fetchStart, count);
+};
+
 // --- Logic: Iframe Communication ---
-const handleRerunMessage = (data) => {
+const handleRerunMessage = (event) => {
  
   // 处理内存报告
 
@@ -241,6 +278,12 @@ const handleGlobalMessage = async (event) => {
         console.error("[UI Refresh] 网络异常", e);
       }
     }
+  }
+
+  // 3. 监听数据源选择消息 (Rerun Data Source Selected)
+  if (event.data?.type === "rerun_datasource_selected") {
+      const { source_id, start_time, end_time } = event.data;
+      handleDataSourceSelection(source_id, start_time, end_time);
   }
 };
 
@@ -442,9 +485,20 @@ const handleDebugForceGC = async () => {
     });
 };
 
+// [新增] 清空后端发送队列 (通用函数)
+const clearBackendQueues = async () => {
+    try {
+        await fetch(API_ENDPOINTS.CLEAR_QUEUES(recordingUuid.value), { method: 'POST' });
+        console.log("[Stream] 后端发送队列已清空");
+    } catch (e) {
+        console.error("[Stream] 清空发送队列失败:", e);
+    }
+};
+
 // [新增] 执行紧急清理流程 (封装通用逻辑)
 const performEmergencyCleanup = async () => {
     if (isCleaningUp.value) return; // 防止重入
+    
     isCleaningUp.value = true;
 
     console.warn(`[Stream] 执行紧急清理流程...`);
@@ -459,8 +513,7 @@ const performEmergencyCleanup = async () => {
         pendingRanges.value.clear();
 
         // 3. 发送清空发送队列请求
-        await fetch(API_ENDPOINTS.CLEAR_QUEUES(recordingUuid.value), { method: 'POST' });
-        console.log("[Stream] 后端发送队列已清空");
+        await clearBackendQueues();
 
         // 4. 触发强制 GC (callRerunForceGC 内部会保护 [current, current+radius])
         callRerunForceGC();
@@ -549,6 +602,9 @@ const requestRerunMemory = () => {
 const checkMemoryUsage = async () => {
     // 如果正在清理中，跳过检查
     if (isCleaningUp.value) return;
+    
+    // 如果用户正在交互，暂停定时的内存检查
+    if (isUserInteracting.value) return;
 
     // 向 Rerun Viewer 发起内存查询请求
     // 实际的清理逻辑将在 handleGlobalMessage 的 rerun_memory_report 分支中触发
@@ -744,6 +800,9 @@ const onTimeUpdate = (data) => {
     // 更新全局状态，供清理逻辑使用
     currentPlaybackFrame.value = currentFrameIdx;
 
+    // [新增] 检查是否需要恢复自动模式
+    checkAndRestoreAutoMode(currentFrameIdx);
+
     // console.log(`[StreamDebug] TimeUpdate: frame=${currentFrameIdx}, playing=${isPlaying}`);
 
     if (isPlaying) {
@@ -758,8 +817,8 @@ const onTimeUpdate = (data) => {
 
 // 场景 1: 正常播放中的流式加载 (也包括暂停时的缺数据检查)
 const handleStreamingPlayback = (currentFrameIdx, isRerunPlaying = false) => {
-    // 如果正在进行紧急清理，暂停一切数据请求
-    if (isCleaningUp.value) return;
+    // 如果正在进行紧急清理或用户交互，暂停一切数据请求
+    if (isCleaningUp.value || isUserInteracting.value) return;
 
     // 0. 如果已经到达整个数据集的末尾，则不再请求
     // 注意 maxFrameIdx 是开区间上限，所以有效最大帧是 maxFrameIdx - 1
@@ -968,29 +1027,6 @@ const handleManualReload = () => {
 
   fetch(API_ENDPOINTS.SEND_SENTINEL(recordingUuid.value) + `?frame_idx=${startFrame}`, { method: 'POST' });
   console.log("[Stream] 哨兵帧已发送");
-};
-
-// 临时调试：输出状态
-const handleDebugDump = () => {
-    console.group("=== Rerun State Dump ===");
-    console.log("loadedRanges:", JSON.parse(JSON.stringify(loadedRanges.value)));
-    console.log("pendingRanges:", [...pendingRanges.value]);
-    console.log("currentPlaybackFrame:", currentPlaybackFrame.value);
-    
-    // Check if current frame is being loaded
-    const isLoadingCurrent = [...pendingRanges.value].some(range => {
-        const [start, end] = range.split('-').map(Number);
-        return currentPlaybackFrame.value >= start && currentPlaybackFrame.value < end;
-    });
-    console.log("isLoadingCurrentFrame:", isLoadingCurrent);
-    
-    console.log("maxFrameIdx:", maxFrameIdx.value);
-    console.log("isPlaying:", playing.value); // Added isPlaying state
-    
-    // [调试] 手动触发一次行数检查
-    requestRerunRowCount();
-    
-    console.groupEnd();
 };
 </script>
 
