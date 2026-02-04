@@ -208,6 +208,9 @@ const checkAndRestoreAutoMode = (currentFrame) => {
 // [新增] 处理数据源选择逻辑
 const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     console.log(`[Rerun Selection] Source: ${source_id}, Range: ${start_time} - ${end_time}`);
+    
+    // 0. 立即触发一次内存检查
+    requestRerunMemory();
       
     // 1. 发送清空发送队列请求
     await clearBackendQueues();
@@ -227,7 +230,7 @@ const handleDataSourceSelection = async (source_id, start_time, end_time) => {
 };
 
 // --- Logic: Iframe Communication ---
-const handleRerunMessage = (event) => {
+const handleRerunMessage = (data) => {
  
   // 处理内存报告
 
