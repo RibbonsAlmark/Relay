@@ -30,7 +30,7 @@ export const RERUN_CONFIG = {
   _PAUSED_BUFFER_COEFF: 1.0, 
 
   // 内存管理配置
-  STREAMING_MEMORY_LIMIT_MB: 1500, // 内存阈值 (MB)，超过此值触发清理
+  STREAMING_MEMORY_LIMIT_MB: 1000, // 内存阈值 (MB)，超过此值触发清理
   STREAMING_SAFE_WINDOW_RADIUS: 500, // 缓存清理时的保留窗口半径 (帧数)
 
   get STREAMING_BUFFER_THRESHOLD() {

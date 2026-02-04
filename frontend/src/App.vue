@@ -54,6 +54,7 @@ const isDragging = ref(false); // 控制 iframe 穿透
 const isInitialized = ref(false);
 const isCleaningUp = ref(false); // 控制紧急清理状态
 const isUserInteracting = ref(false); // 用户是否正在交互 (暂停自动加载/GC)
+const isSourceSwitching = ref(false); // [新增] 是否正在切换数据源 (用于屏蔽跳转过程中的越界检查)
 const selectedSourceRange = ref(null); // 当前用户选中的数据源范围 { start, end }
 const rerunViewerRef = ref(null); // 引用 RerunViewer 组件实例
 
@@ -136,6 +137,9 @@ watch(recordingUuid, (newId) => {
 
 // [新增] 检查并恢复自动模式 (当播放超出选中范围时)
 const checkAndRestoreAutoMode = (currentFrame) => {
+    // 如果正在切换源的过程中，不要检查，以免误判
+    if (isSourceSwitching.value) return;
+
     if (!isUserInteracting.value || !selectedSourceRange.value) return;
 
     const { start, end } = selectedSourceRange.value;
@@ -184,7 +188,11 @@ const checkMemoryAndGC = () => {
 // [新增] 处理数据源选择逻辑
 const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     console.log(`[Rerun Selection] Source: ${source_id}, Range: ${start_time} - ${end_time}`);
-    
+
+    // 0. 标记正在切换源，并立即跳转
+    isSourceSwitching.value = true;
+    jumpToTime("frame_idx", start_time); // 跳转起始点
+
     // 1. 设置信号量，暂停到达阈值之后的数据获取触发 + 暂停 GC
     isUserInteracting.value = true;
     console.log("[Stream] 用户交互模式已激活 (暂停自动加载与GC)");
@@ -212,6 +220,11 @@ const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     const count = (fetchEnd - fetchStart) + extraFrames;
     
     await handleLoadRange(fetchStart, count);
+
+    isSourceSwitching.value = false;
+
+    // 6. 设置循环范围
+    setLoopSelection("frame_idx", start_time, end_time);
 };
 
 // --- Logic: Iframe Communication ---
@@ -384,6 +397,23 @@ const jumpToTime = (timeline, timeVal) => {
     }
 };
 
+// [新增] 设置 Rerun 循环播放区域
+const setLoopSelection = (timeline, start, end) => {
+    const win = getRerunWindow();
+    if (win) {
+        console.log(`[Stream] 设置循环区域: [${start}, ${end}]`);
+        win.postMessage({
+            type: "rerun_set_loop_selection",
+            recording_id: recordingUuid.value,
+            timeline: timeline,
+            start: start,
+            end: end
+        }, "*");
+    } else {
+        console.warn("[Stream] 无法获取 iframe window，设置循环区域失败");
+    }
+};
+
 // 调用 Rerun 内部接口清理数据
 const callRerunDrop = (start, end) => {
     const win = getRerunWindow();
@@ -538,7 +568,9 @@ const performEmergencyCleanup = async () => {
 
         // 6. 向后请求数据
         // 重新启动数据流，确保后续播放流畅
-        await handleLoadRange(currentFrame, batchSize);
+        if (isUserInteracting.value !== true) {
+          await handleLoadRange(currentFrame, batchSize);
+        }
 
         await new Promise(resolve => setTimeout(resolve, 1000));
         
@@ -795,6 +827,16 @@ const onTimeUpdate = (data) => {
     currentPlaybackFrame.value = currentFrameIdx;
 
     // [新增] 检查是否需要恢复自动模式
+    // 如果正在切换源，先检查是否已经跳到了目标区间
+    if (isSourceSwitching.value && selectedSourceRange.value) {
+        const { start, end } = selectedSourceRange.value;
+        const buffer = 5; // 允许一点误差
+        if (currentFrameIdx >= start - buffer && currentFrameIdx <= end + buffer) {
+             console.log(`[Stream] 跳转完成，解除切换锁定 (Frame ${currentFrameIdx} in [${start}, ${end}])`);
+             isSourceSwitching.value = false;
+        }
+    }
+
     checkAndRestoreAutoMode(currentFrameIdx);
 
     // console.log(`[StreamDebug] TimeUpdate: frame=${currentFrameIdx}, playing=${isPlaying}`);
