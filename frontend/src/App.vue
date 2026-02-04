@@ -1,64 +1,6 @@
 <template>
   <div id="app" :class="{ 'is-dragging': isDragging }">
-    <!-- <div class="controls">
-      <div class="input-group">
-        <label>数据库：</label>
-        <input 
-          v-model="selectedDB" 
-          list="db-options" 
-          placeholder="点击选择"
-          @focus="handleDBFocus"
-          @input="onDBChange"
-        >
-        <datalist id="db-options">
-          <option v-for="dbName in Object.keys(rerunStore.dbStructure)" :key="dbName" :value="dbName" />
-        </datalist>
-      </div>
 
-      <div class="input-group">
-        <label>数据集：</label>
-        <input 
-          v-model="selectedDataset" 
-          list="dataset-options" 
-          placeholder="点击选择"
-          :disabled="!selectedDB"
-          @focus="handleDSFocus"
-        >
-        <datalist id="dataset-options">
-          <option v-for="ds in availableDatasets" :key="ds" :value="ds" />
-        </datalist>
-      </div>
-
-      <div class="btn-group">
-        <button 
-          type="button"
-          class="generate-btn" 
-          @click.stop.prevent="handleCreateSource" 
-          :disabled="loading || !selectedDB || !selectedDataset"
-        >
-          {{ loading ? '...' : '生成数据源URL' }}
-        </button>
-
-        <button 
-          type="button"
-          class="play-btn" 
-          @click.stop.prevent="handlePlayData" 
-          :disabled="!recordingUuid || playing"
-        >
-          {{ playing ? '传输中...' : '开始数据传输' }}
-        </button>
-      </div>
-
-      <div v-if="currentSource" class="result-container">
-        <span class="tag">Rerun URL</span>
-        <div class="result-box" @click="copyToClipboard" title="点击复制 URL">
-          <span class="url-text">{{ currentSource }}</span>
-          <span class="copy-icon">{{ copied ? '✅' : '📋' }}</span>
-        </div>
-      </div>
-    </div> -->
-
-    
     <RerunViewer 
       v-if="isInitialized" 
       ref="rerunViewerRef"
@@ -209,18 +151,20 @@ const checkAndRestoreAutoMode = (currentFrame) => {
 const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     console.log(`[Rerun Selection] Source: ${source_id}, Range: ${start_time} - ${end_time}`);
     
-    // 0. 立即触发一次内存检查
-    requestRerunMemory();
-      
-    // 1. 发送清空发送队列请求
-    await clearBackendQueues();
-
-    // 2. 设置信号量，暂停到达阈值之后的数据获取触发 + 暂停 GC
+    // 1. 设置信号量，暂停到达阈值之后的数据获取触发 + 暂停 GC
     isUserInteracting.value = true;
-    selectedSourceRange.value = { start: start_time, end: end_time };
     console.log("[Stream] 用户交互模式已激活 (暂停自动加载与GC)");
 
-    // 3. 获取数据请求 (获取该 source 的范围 + 向右 10 帧)
+    // 2. 立即触发一次内存检查
+    requestRerunMemory();
+      
+    // 3. 发送清空发送队列请求
+    await clearBackendQueues();
+
+    // 4. 设置信号量，暂停到达阈值之后的数据获取触发 + 暂停 GC
+    selectedSourceRange.value = { start: start_time, end: end_time };
+
+    // 5. 获取数据请求 (获取该 source 的范围 + 向右 10 帧)
     const fetchStart = Math.floor(start_time);
     const fetchEnd = Math.ceil(end_time);
     const extraFrames = 10;
@@ -808,7 +752,7 @@ const onTimeUpdate = (data) => {
 
     // console.log(`[StreamDebug] TimeUpdate: frame=${currentFrameIdx}, playing=${isPlaying}`);
 
-    if (isPlaying) {
+    if (isUserInteracting.value !== true && isPlaying) {
       handleStreamingPlayback(currentFrameIdx, true);
     } else {
       // 即使暂停了，也要检查是否是因为缺数据导致的暂停
