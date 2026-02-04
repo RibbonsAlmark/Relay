@@ -66,6 +66,7 @@ const currentPlaybackFrame = ref(0); // 当前播放帧索引
 const memoryUsage = ref(0); // Rerun 内存使用量 (MB)
 let heartbeatTimer = null;
 let memoryMonitorTimer = null;
+let memoryCheckResolver = null; // 用于同步内存检查的 Promise resolver
 
 // --- Config ---
 // 仅在非生产模式下显示调试面板
@@ -147,6 +148,39 @@ const checkAndRestoreAutoMode = (currentFrame) => {
     }
 };
 
+// [新增] 等待清理完成 (Helper)
+const waitForCleanup = () => {
+    if (!isCleaningUp.value) return Promise.resolve();
+    return new Promise(resolve => {
+        const unwatch = watch(isCleaningUp, (val) => {
+            if (!val) {
+                unwatch();
+                resolve();
+            }
+        });
+    });
+};
+
+// [新增] 同步执行内存检查 (Helper)
+const checkMemoryAndGC = () => {
+    return new Promise((resolve) => {
+        // 如果已有挂起的检查，先结束它
+        if (memoryCheckResolver) memoryCheckResolver();
+        
+        memoryCheckResolver = resolve;
+        requestRerunMemory();
+        
+        // 超时保护：如果 2秒内没收到回复，强制继续，防止死锁
+        setTimeout(() => {
+            if (memoryCheckResolver) {
+                // console.warn("[Stream] 内存检查超时，继续执行");
+                memoryCheckResolver();
+                memoryCheckResolver = null;
+            }
+        }, 2000);
+    });
+};
+
 // [新增] 处理数据源选择逻辑
 const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     console.log(`[Rerun Selection] Source: ${source_id}, Range: ${start_time} - ${end_time}`);
@@ -155,8 +189,15 @@ const handleDataSourceSelection = async (source_id, start_time, end_time) => {
     isUserInteracting.value = true;
     console.log("[Stream] 用户交互模式已激活 (暂停自动加载与GC)");
 
-    // 2. 立即触发一次内存检查
-    requestRerunMemory();
+    // 2. 同步执行内存检查与潜在的 GC
+    // 等待内存报告返回
+    await checkMemoryAndGC();
+
+    // 如果报告触发了 GC (isCleaningUp 变为了 true)，则等待 GC 完成
+    if (isCleaningUp.value) {
+        console.log("[Stream] 检测到 GC 正在执行，等待清理完成...");
+        await waitForCleanup();
+    }
       
     // 3. 发送清空发送队列请求
     await clearBackendQueues();
@@ -186,6 +227,12 @@ const handleRerunMessage = (data) => {
   if (usageMB > RERUN_CONFIG.STREAMING_MEMORY_LIMIT_MB && !isCleaningUp.value) {
     console.warn(`[AutoGC] 内存占用 (${usageMB} MB) > 阈值，触发清理...`);
     performEmergencyCleanup();
+  }
+
+  // [Sync] 如果有挂起的内存检查 Promise，解决它
+  if (memoryCheckResolver) {
+      memoryCheckResolver();
+      memoryCheckResolver = null;
   }
 };
 
@@ -752,7 +799,9 @@ const onTimeUpdate = (data) => {
 
     // console.log(`[StreamDebug] TimeUpdate: frame=${currentFrameIdx}, playing=${isPlaying}`);
 
-    if (isUserInteracting.value !== true && isPlaying) {
+    if (isUserInteracting.value === true) {
+      // console.log("[StreamDebug] 用户交互中，不处理自动播放");
+    } else if (isPlaying) {
       handleStreamingPlayback(currentFrameIdx, true);
     } else {
       // 即使暂停了，也要检查是否是因为缺数据导致的暂停
